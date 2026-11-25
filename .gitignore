@@ -1,0 +1,19 @@
+# Android / Gradle
+android/.gradle/
+android/**/build/
+android/local.properties
+android/.idea/
+android/captures/
+android/**/.cxx/
+*.iml
+
+# Rust
+pc/target/
+
+# Editors / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local probe reports pulled from phones
+reports/

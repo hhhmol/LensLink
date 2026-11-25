@@ -1,0 +1,9 @@
+[package]
+name = "lenslink-host"
+description = "LensLink Windows host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lenslink-protocol = { path = "../lenslink-protocol" }

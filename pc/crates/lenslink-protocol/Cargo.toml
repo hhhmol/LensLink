@@ -1,0 +1,8 @@
+[package]
+name = "lenslink-protocol"
+description = "LensLink wire protocol: handshake and packet framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
