@@ -2,6 +2,7 @@
 
 pub mod decoder;
 mod preview;
+mod vcam;
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -13,6 +14,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 pub use crate::stream::Codec;
 use decoder::Decoder;
 use preview::Preview;
+use vcam::VirtualCamera;
 
 /// COM and Media Foundation for the calling thread; call once before anything else here.
 pub fn init() -> Result<(), String> {
@@ -44,19 +46,24 @@ pub fn create_device() -> windows::core::Result<ID3D11Device> {
     }
 }
 
-/// Decoder plus window, driven from the thread that created it.
+/// Decoder plus its outputs (window and/or virtual camera), driven from the thread that created it.
 pub struct Viewer {
     decoder: Decoder,
-    preview: Preview,
+    preview: Option<Preview>,
+    camera: Option<VirtualCamera>,
     title: String,
 }
 
+pub struct Outputs {
+    pub window: bool,
+    pub virtual_camera: bool,
+}
+
 impl Viewer {
-    pub fn new(codec: Codec, width: u32, height: u32, fps: u32, title: &str) -> Result<Self, String> {
+    pub fn new(codec: Codec, width: u32, height: u32, fps: u32, title: &str, outputs: Outputs) -> Result<Self, String> {
         if !decoder::available(codec) {
             return Err(match codec {
-                Codec::H265 => "Windows has no H.265 decoder. Install \"HEVC Video Extensions\" from the \
-                                Microsoft Store, or use --codec h264"
+                Codec::H265 => "Windows has no H.265 decoder. Install \"HEVC Video Extensions\" from the                                 Microsoft Store, or use --codec h264"
                     .into(),
                 Codec::H264 => "Windows has no hardware H.264 decoder; use --ffplay".into(),
             });
@@ -64,13 +71,24 @@ impl Viewer {
         let device = create_device().map_err(|e| format!("Direct3D 11: {e}"))?;
         let decoder =
             Decoder::new(&device, codec, width, height, fps).map_err(|e| format!("decoder: {e}"))?;
-        let preview = Preview::new(&device, title, (width, height)).map_err(|e| format!("window: {e}"))?;
-        Ok(Viewer { decoder, preview, title: title.to_string() })
+        let camera = if outputs.virtual_camera {
+            let c = VirtualCamera::new(&device, (width, height))?;
+            eprintln!("virtual camera \"{}\" is available to apps", lenslink_vcam::FRIENDLY_NAME);
+            Some(c)
+        } else {
+            None
+        };
+        let preview = if outputs.window {
+            Some(Preview::new(&device, title, (width, height)).map_err(|e| format!("window: {e}"))?)
+        } else {
+            None
+        };
+        Ok(Viewer { decoder, preview, camera, title: title.to_string() })
     }
 
     /// Returns false once the user closed the window.
     pub fn pump(&mut self) -> bool {
-        self.preview.pump()
+        self.preview.as_mut().is_none_or(Preview::pump)
     }
 
     pub fn packet(&mut self, data: &[u8], pts_us: u64, config: bool, keyframe: bool) -> Result<(), String> {
@@ -80,12 +98,23 @@ impl Viewer {
             .map_err(|e| format!("{:?} decode: {e}", self.decoder.codec()))?;
         // Only the newest frame matters for a live view.
         if let Some(frame) = frames.last() {
-            self.preview.show(frame).map_err(|e| format!("display: {e}"))?;
+            if let Some(c) = self.camera.as_mut() {
+                c.push(frame).map_err(|e| format!("virtual camera: {e}"))?;
+            }
+            if let Some(p) = self.preview.as_mut() {
+                p.show(frame).map_err(|e| format!("display: {e}"))?;
+            }
         }
         Ok(())
     }
 
     pub fn status(&self, text: &str) {
-        self.preview.set_title(&format!("{} — {text}", self.title));
+        if let Some(p) = &self.preview {
+            let cam = match &self.camera {
+                Some(c) if c.connected() => "  camera in use",
+                _ => "",
+            };
+            p.set_title(&format!("{} — {text}{cam}", self.title));
+        }
     }
 }

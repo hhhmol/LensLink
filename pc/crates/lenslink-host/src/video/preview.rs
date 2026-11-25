@@ -237,7 +237,7 @@ impl Drop for Preview {
 }
 
 /// Largest rectangle with the picture's aspect ratio, centred in the window.
-fn letterbox(picture: (u32, u32), window: (u32, u32)) -> RECT {
+pub(super) fn letterbox(picture: (u32, u32), window: (u32, u32)) -> RECT {
     let scale = (window.0 as f64 / picture.0 as f64).min(window.1 as f64 / picture.1 as f64);
     let w = (picture.0 as f64 * scale).round() as i32;
     let h = (picture.1 as f64 * scale).round() as i32;

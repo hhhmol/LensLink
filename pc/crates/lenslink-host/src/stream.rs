@@ -59,6 +59,7 @@ pub struct Options {
     pub zoom: Option<f32>,
     pub stabilization: bool,
     pub player: Player,
+    pub virtual_camera: bool,
     pub out: Option<PathBuf>,
 }
 
@@ -76,6 +77,7 @@ impl Default for Options {
             zoom: None,
             stabilization: true,
             player: Player::Window,
+            virtual_camera: false,
             out: None,
         }
     }
@@ -92,8 +94,9 @@ stream options:
   --zoom <ratio>         logical-camera zoom, e.g. 0.6 for ultrawide
   --no-stabilization     disable EIS/OIS
   --out <file>           also save the raw stream (.h264 / .h265)
+  --vcam                 also publish the video as the \"LensLink\" virtual camera
   --ffplay               show the video in ffplay instead of the LensLink window
-  --no-play              no window, only --out";
+  --no-play              no window (use with --vcam or --out)";
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
@@ -127,13 +130,14 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--zoom" => o.zoom = Some(value(arg)?.parse().map_err(|_| "bad --zoom".to_string())?),
             "--no-stabilization" => o.stabilization = false,
             "--out" => o.out = Some(PathBuf::from(value(arg)?)),
+            "--vcam" => o.virtual_camera = true,
             "--ffplay" => o.player = Player::Ffplay,
             "--no-play" => o.player = Player::None,
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if o.player == Player::None && o.out.is_none() {
-        return Err("--no-play without --out would discard the video".into());
+    if o.player == Player::None && o.out.is_none() && !o.virtual_camera {
+        return Err("--no-play without --out or --vcam would discard the video".into());
     }
     Ok(o)
 }
@@ -208,9 +212,10 @@ fn stream(o: &Options) -> Result<(), String> {
     };
     let title = format!("LensLink {}x{}@{} {}", o.width, o.height, o.fps, o.codec.wire_name());
     let mut ffplay = if o.player == Player::Ffplay { Some(spawn_ffplay(o, &title)?) } else { None };
-    let mut viewer = if o.player == Player::Window {
+    let mut viewer = if o.player == Player::Window || o.virtual_camera {
         video::init()?;
-        Some(Viewer::new(o.codec, o.width, o.height, o.fps, &title)?)
+        let outputs = video::Outputs { window: o.player == Player::Window, virtual_camera: o.virtual_camera };
+        Some(Viewer::new(o.codec, o.width, o.height, o.fps, &title, outputs)?)
     } else {
         None
     };

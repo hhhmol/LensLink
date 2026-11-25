@@ -70,8 +70,21 @@ playing the stream into a user-installed virtual cable.
 1. **Camera probe** — report Camera2 / encoder capabilities of each phone. ✓
 2. **Stream MVP** — phone streams H.264 over ADB; PC saves it / plays it with `ffplay`. Measure latency. ✓
 3. **Rust host** — protocol, GPU decode (Media Foundation + DXVA), preview window (D3D11 video processor). ✓
-4. **Virtual camera** — Media Foundation media source + `MFCreateVirtualCamera`. ← next
-5. **Controls** — resolution, fps, lens, focus, exposure, ISO, WB from the tray app.
+4. **Virtual camera** — Media Foundation media source + `MFCreateVirtualCamera`. ✓
+5. **Controls** — resolution, fps, lens, focus, exposure, ISO, WB from the tray app. ← next
 6. **Filters** — shader filters, then segmentation, then interpolation.
 7. **Polish** — auto-reconnect, autostart, installer, battery/thermal guards on the phone.
 
+## Virtual camera internals (step 4)
+
+- `pc/crates/lenslink-vcam` is a COM DLL: class factory → `IMFActivate` → `IMFMediaSourceEx` with one
+  `IMFMediaStream2`. The Frame Server service loads it in session 0 as LOCAL SERVICE and shares the
+  camera between apps.
+- The host creates the camera with `MFCreateVirtualCamera` (session lifetime, current user), scales each
+  decoded frame on the GPU into a 1080p NV12 texture, reads it back and writes it to shared memory.
+- Shared memory and its event live in `Global\`. Only a service may create global objects, so the
+  camera side creates them with an ACL for interactive users; the host opens them while an app has the
+  camera open and drops frames cheaply otherwise.
+- The stream answers each `RequestSample` with the newest host frame as soon as one arrives, so the
+  camera adds no fixed delay. Without host frames for 1 s it sends a dark grey placeholder at 30 fps.
+- The camera log is `C:\ProgramData\LensLink\logs\vcam.log`.

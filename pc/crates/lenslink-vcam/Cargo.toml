@@ -1,0 +1,32 @@
+[package]
+name = "lenslink-vcam"
+description = "LensLink virtual camera: Media Foundation media source loaded by the Windows Frame Server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: the DLL registered as the camera source. rlib: lets the host use the shared-memory channel.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows-core = "0.62"
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+]

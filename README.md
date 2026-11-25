@@ -18,21 +18,23 @@ video / [audio] / control  ◄───────────────  cam
 
 ## Status
 
-Pre-alpha, step 3 of the [roadmap](docs/architecture.md#roadmap). Working now:
+Pre-alpha, step 4 of the [roadmap](docs/architecture.md#roadmap) done. Working now:
 
 - a **camera probe** that reports what Camera2 and the hardware encoders of a phone can really do;
 - **streaming** the phone camera over USB into a LensLink window on the PC, decoded on the GPU
-  (≈ 200 ms glass-to-glass at 1080p30 on a Redmi Note 8T).
+  (≈ 200 ms glass-to-glass at 1080p30 on a Redmi Note 8T);
+- a **Windows 11 virtual camera** "LensLink" that any app can pick (Camera, Teams, Zoom, browsers),
+  1080p30 NV12.
 
-Not yet: the Windows virtual camera, so other apps cannot see the phone yet.
+Not yet: camera controls from the PC, filters, a tray app, an installer.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `android/` | Phone app (Kotlin, no third-party dependencies) |
-| `pc/` | Windows host (Rust workspace) |
-| `tools/` | Latency clock |
+| `pc/` | Windows host and virtual camera (Rust workspace) |
+| `tools/` | Virtual camera installer, latency clock |
 | `docs/architecture.md` | Design decisions and roadmap |
 | `docs/protocol.md` | Wire protocol between phone and PC |
 
@@ -73,6 +75,31 @@ cargo run --release -p lenslink-host -- stream
 A window shows the camera; Esc closes it. Useful options: `--size 3840x2160`, `--fps 60`,
 `--codec h265` (needs *HEVC Video Extensions* from the Microsoft Store), `--zoom 0.6`,
 `--out file.h264`, `--ffplay` (play in FFmpeg's ffplay instead). `lenslink-host` without arguments lists all options.
+
+## Virtual camera
+
+Install the camera once (asks for administrator rights):
+
+```powershell
+cd pc
+cargo build --release
+..\tools\install-vcam.ps1
+```
+
+The script copies `lenslink_vcam.dll` to `C:\Program Files\LensLink`, registers it in HKLM (the Windows
+camera service, Frame Server, does not read per-user registrations) and creates
+`C:\ProgramData\LensLink\logs` for its log. `install-vcam.ps1 -Uninstall` removes it.
+
+Then stream with `--vcam`:
+
+```powershell
+cargo run --release -p lenslink-host -- stream --vcam            # with the preview window
+cargo run --release -p lenslink-host -- stream --vcam --no-play  # camera only
+```
+
+The camera "LensLink" appears in apps while `lenslink-host` runs and disappears when it exits.
+Without a phone stream it shows dark grey. `cargo run --release -p lenslink-vcam --example grab`
+opens the camera like an app and reports the frame rate it receives.
 
 ## License
 

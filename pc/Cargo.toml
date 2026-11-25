@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lenslink-protocol", "crates/lenslink-host"]
+members = ["crates/lenslink-protocol", "crates/lenslink-host", "crates/lenslink-vcam"]
 
 [workspace.package]
 version = "0.1.0"

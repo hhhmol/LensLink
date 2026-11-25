@@ -13,6 +13,7 @@ name = "lenslink-host"
 version = "0.1.0"
 dependencies = [
  "lenslink-protocol",
+ "lenslink-vcam",
  "serde_json",
  "windows",
 ]
@@ -20,6 +21,14 @@ dependencies = [
 [[package]]
 name = "lenslink-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "lenslink-vcam"
+version = "0.1.0"
+dependencies = [
+ "windows",
+ "windows-core",
+]
 
 [[package]]
 name = "memchr"
