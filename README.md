@@ -18,8 +18,13 @@ video / [audio] / control  ◄───────────────  cam
 
 ## Status
 
-Pre-alpha. Step 1 of the [roadmap](docs/architecture.md#roadmap): a **camera probe**
-that reports what Camera2 and the hardware encoders of a given phone can really do.
+Pre-alpha, step 3 of the [roadmap](docs/architecture.md#roadmap). Working now:
+
+- a **camera probe** that reports what Camera2 and the hardware encoders of a phone can really do;
+- **streaming** the phone camera over USB into a LensLink window on the PC, decoded on the GPU
+  (≈ 200 ms glass-to-glass at 1080p30 on a Redmi Note 8T).
+
+Not yet: the Windows virtual camera, so other apps cannot see the phone yet.
 
 ## Layout
 
@@ -27,6 +32,7 @@ that reports what Camera2 and the hardware encoders of a given phone can really 
 |---|---|
 | `android/` | Phone app (Kotlin, no third-party dependencies) |
 | `pc/` | Windows host (Rust workspace) |
+| `tools/` | Latency clock |
 | `docs/architecture.md` | Design decisions and roadmap |
 | `docs/protocol.md` | Wire protocol between phone and PC |
 
@@ -54,6 +60,19 @@ cargo run -p lenslink-host -- probe
 
 Xiaomi phones block `installDebug` unless *Install via USB* is enabled (needs a Mi account).
 Alternative: copy `android/app/build/outputs/apk/debug/app-debug.apk` to the phone and open it.
+
+## Streaming
+
+On the phone: open LensLink and tap **Start streaming service**. On the PC:
+
+```powershell
+cd pc
+cargo run --release -p lenslink-host -- stream
+```
+
+A window shows the camera; Esc closes it. Useful options: `--size 3840x2160`, `--fps 60`,
+`--codec h265` (needs *HEVC Video Extensions* from the Microsoft Store), `--zoom 0.6`,
+`--out file.h264`, `--ffplay` (play in FFmpeg's ffplay instead). `lenslink-host` without arguments lists all options.
 
 ## License
 

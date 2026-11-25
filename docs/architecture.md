@@ -67,10 +67,11 @@ playing the stream into a user-installed virtual cable.
 
 ## Roadmap
 
-1. **Camera probe** — report Camera2 / encoder capabilities of each phone. ← current
-2. **Stream MVP** — phone streams H.264 over ADB; PC saves it / plays it with `ffplay`. Measure latency.
-3. **Rust host** — protocol, GPU decode, preview window.
-4. **Virtual camera** — Media Foundation media source + `MFCreateVirtualCamera`.
+1. **Camera probe** — report Camera2 / encoder capabilities of each phone. ✓
+2. **Stream MVP** — phone streams H.264 over ADB; PC saves it / plays it with `ffplay`. Measure latency. ✓
+3. **Rust host** — protocol, GPU decode (Media Foundation + DXVA), preview window (D3D11 video processor). ✓
+4. **Virtual camera** — Media Foundation media source + `MFCreateVirtualCamera`. ← next
 5. **Controls** — resolution, fps, lens, focus, exposure, ISO, WB from the tray app.
 6. **Filters** — shader filters, then segmentation, then interpolation.
 7. **Polish** — auto-reconnect, autostart, installer, battery/thermal guards on the phone.
+

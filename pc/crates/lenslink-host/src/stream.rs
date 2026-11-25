@@ -4,12 +4,14 @@ use std::io::{self, BufReader, IsTerminal, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use lenslink_protocol::{self as proto, flags, Kind, ProtocolError};
 use serde_json::{json, Value};
 
 use crate::adb;
+use crate::video::{self, Viewer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -18,7 +20,7 @@ pub enum Codec {
 }
 
 impl Codec {
-    fn wire_name(self) -> &'static str {
+    pub fn wire_name(self) -> &'static str {
         match self {
             Codec::H264 => "h264",
             Codec::H265 => "h265",
@@ -34,6 +36,16 @@ impl Codec {
     }
 }
 
+/// Where the live picture goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Player {
+    /// Our own window: GPU decode, lowest latency.
+    Window,
+    /// ffplay, kept for comparison and for machines without a hardware decoder.
+    Ffplay,
+    None,
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub serial: Option<String>,
@@ -46,7 +58,7 @@ pub struct Options {
     pub bitrate: u32,
     pub zoom: Option<f32>,
     pub stabilization: bool,
-    pub play: bool,
+    pub player: Player,
     pub out: Option<PathBuf>,
 }
 
@@ -63,7 +75,7 @@ impl Default for Options {
             bitrate: 20_000_000,
             zoom: None,
             stabilization: true,
-            play: true,
+            player: Player::Window,
             out: None,
         }
     }
@@ -80,7 +92,8 @@ stream options:
   --zoom <ratio>         logical-camera zoom, e.g. 0.6 for ultrawide
   --no-stabilization     disable EIS/OIS
   --out <file>           also save the raw stream (.h264 / .h265)
-  --no-play              do not open the ffplay window";
+  --ffplay               show the video in ffplay instead of the LensLink window
+  --no-play              no window, only --out";
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
@@ -114,11 +127,12 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--zoom" => o.zoom = Some(value(arg)?.parse().map_err(|_| "bad --zoom".to_string())?),
             "--no-stabilization" => o.stabilization = false,
             "--out" => o.out = Some(PathBuf::from(value(arg)?)),
-            "--no-play" => o.play = false,
+            "--ffplay" => o.player = Player::Ffplay,
+            "--no-play" => o.player = Player::None,
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if !o.play && o.out.is_none() {
+    if o.player == Player::None && o.out.is_none() {
         return Err("--no-play without --out would discard the video".into());
     }
     Ok(o)
@@ -192,48 +206,88 @@ fn stream(o: &Options) -> Result<(), String> {
         ),
         None => None,
     };
-    let mut player = if o.play { Some(spawn_ffplay(o)?) } else { None };
+    let title = format!("LensLink {}x{}@{} {}", o.width, o.height, o.fps, o.codec.wire_name());
+    let mut ffplay = if o.player == Player::Ffplay { Some(spawn_ffplay(o, &title)?) } else { None };
+    let mut viewer = if o.player == Player::Window {
+        video::init()?;
+        Some(Viewer::new(o.codec, o.width, o.height, o.fps, &title)?)
+    } else {
+        None
+    };
 
-    let mut stats = Stats::new();
-    loop {
-        let packet = match proto::read_packet(&mut reader) {
-            Ok(Some(p)) => p,
-            Ok(None) => return Err("the phone closed the connection".into()),
-            Err(e) => return Err(e.to_string()),
-        };
-        match packet.header.kind {
-            Kind::Control => {
-                let text = String::from_utf8_lossy(&packet.payload);
-                let msg: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                match msg["type"].as_str() {
-                    Some("error") => {
-                        return Err(format!("phone: {}", msg["message"].as_str().unwrap_or("unknown error")))
-                    }
-                    Some("device_info") => eprintln!(
-                        "phone: {} {}, Android {}",
-                        msg["manufacturer"].as_str().unwrap_or("?"),
-                        msg["model"].as_str().unwrap_or("?"),
-                        msg["android"].as_str().unwrap_or("?")
-                    ),
-                    _ => eprintln!("phone: {text}"),
-                }
-            }
-            Kind::Video => {
-                if let Some(f) = file.as_mut() {
-                    f.write_all(&packet.payload).map_err(|e| format!("write file: {e}"))?;
-                }
-                if let Some(p) = player.as_mut() {
-                    let stdin = p.stdin.as_mut().expect("ffplay stdin is piped");
-                    if stdin.write_all(&packet.payload).is_err() {
-                        eprintln!("\nplayer window closed");
-                        return Ok(());
-                    }
-                }
-                stats.add(&packet.header, packet.payload.len());
-            }
-            Kind::Audio | Kind::Unknown(_) => {}
+    // The socket is read on its own thread so the window keeps responding while no frame arrives.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || loop {
+        let r = proto::read_packet(&mut reader);
+        let last = !matches!(r, Ok(Some(_)));
+        if tx.send(r).is_err() || last {
+            break;
         }
-    }
+    });
+    let result = (|| {
+        let mut stats = Stats::new();
+        loop {
+            if let Some(v) = viewer.as_mut() {
+                if !v.pump() {
+                    eprintln!("
+window closed");
+                    return Ok(());
+                }
+            }
+            let packet = match rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err("the phone closed the connection".to_string())
+                }
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(RecvTimeoutError::Timeout) => continue,
+            };
+            match packet.header.kind {
+                Kind::Control => {
+                    let text = String::from_utf8_lossy(&packet.payload);
+                    let msg: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    match msg["type"].as_str() {
+                        Some("error") => {
+                            return Err(format!("phone: {}", msg["message"].as_str().unwrap_or("unknown error")))
+                        }
+                        Some("device_info") => eprintln!(
+                            "phone: {} {}, Android {}",
+                            msg["manufacturer"].as_str().unwrap_or("?"),
+                            msg["model"].as_str().unwrap_or("?"),
+                            msg["android"].as_str().unwrap_or("?")
+                        ),
+                        _ => eprintln!("phone: {text}"),
+                    }
+                }
+                Kind::Video => {
+                    let h = &packet.header;
+                    if let Some(f) = file.as_mut() {
+                        f.write_all(&packet.payload).map_err(|e| format!("write file: {e}"))?;
+                    }
+                    if let Some(p) = ffplay.as_mut() {
+                        let stdin = p.stdin.as_mut().expect("ffplay stdin is piped");
+                        if stdin.write_all(&packet.payload).is_err() {
+                            eprintln!("
+player window closed");
+                            return Ok(());
+                        }
+                    }
+                    if let Some(v) = viewer.as_mut() {
+                        v.packet(&packet.payload, h.pts_us, h.has(flags::CONFIG), h.has(flags::KEYFRAME))?;
+                    }
+                    if let Some(line) = stats.add(h, packet.payload.len()) {
+                        if let Some(v) = viewer.as_ref() {
+                            v.status(&line);
+                        }
+                    }
+                }
+                Kind::Audio | Kind::Unknown(_) => {}
+            }
+        }
+    })();
+    // Unblocks the reader thread.
+    let _ = writer.shutdown(std::net::Shutdown::Both);
+    result
 }
 
 fn send_control(w: &mut impl Write, msg: &Value) -> Result<(), String> {
@@ -250,8 +304,7 @@ fn is_closed(e: &io::Error) -> bool {
 /// ffplay tuned for latency: no input buffering, no probing, drop late frames.
 /// `-thread_type slice` matters most: FFmpeg's default frame threading queues one frame per CPU thread
 /// (16 threads at 30 fps = 0.5 s). `setpts=0` shows each frame as soon as it is decoded.
-fn spawn_ffplay(o: &Options) -> Result<Child, String> {
-    let title = format!("LensLink {}x{}@{} {}", o.width, o.height, o.fps, o.codec.wire_name());
+fn spawn_ffplay(o: &Options, title: &str) -> Result<Child, String> {
     let fps = o.fps.to_string();
     Command::new("ffplay")
         .args([
@@ -260,7 +313,7 @@ fn spawn_ffplay(o: &Options) -> Result<Child, String> {
             "-probesize", "32", "-analyzeduration", "0", "-sync", "ext",
             "-thread_type", "slice",
             "-f", o.codec.ffmpeg_format(), "-framerate", &fps,
-            "-window_title", &title,
+            "-window_title", title,
             "-i", "-",
             "-vf", "setpts=0",
         ])
@@ -295,10 +348,11 @@ impl Stats {
         }
     }
 
-    fn add(&mut self, h: &proto::Header, len: usize) {
+    /// Returns the summary line once per second.
+    fn add(&mut self, h: &proto::Header, len: usize) -> Option<String> {
         self.bytes += len;
         if h.has(flags::CONFIG) {
-            return;
+            return None;
         }
         self.frames += 1;
         self.total_frames += 1;
@@ -314,7 +368,7 @@ impl Stats {
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();
             let line = format!(
-                "{:>6.0}s  {:5.1} fps  {:6.2} Mbit/s  keyframes {}  max frame gap {:4.0} ms",
+                "{:>4.0}s  {:5.1} fps  {:6.2} Mbit/s  keyframes {}  max frame gap {:4.0} ms",
                 self.started.elapsed().as_secs_f64(),
                 self.frames as f64 / secs,
                 self.bytes as f64 * 8.0 / secs / 1e6,
@@ -333,7 +387,9 @@ impl Stats {
             self.keyframes = 0;
             self.bytes = 0;
             self.max_gap_us = 0;
+            return Some(line);
         }
+        None
     }
 }
 
@@ -349,7 +405,7 @@ mod tests {
     fn defaults() {
         let o = parse(&[]).unwrap();
         assert_eq!((o.width, o.height, o.fps, o.codec), (1920, 1080, 30, Codec::H264));
-        assert!(o.play);
+        assert_eq!(o.player, Player::Window);
     }
 
     #[test]

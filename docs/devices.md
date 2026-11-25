@@ -26,6 +26,11 @@ Glass-to-glass latency (`tools/latency.html`, phone filming the clock, ffplay wi
 4 screenshots): **≈ 200–250 ms**, Note 8T, 1080p30.
 Before `-thread_type slice` in ffplay it was ≈ 0.5–1 s: FFmpeg frame threading queued one frame per CPU thread.
 
+With the LensLink window (step 3: Media Foundation decoder on the GPU, D3D11 video processor, flip-model
+present without vsync wait), same phone and mode, 4 screenshots: 165–265 ms, **≈ 200 ms** on average.
+That is within measurement noise of tuned ffplay: the PC side was already fast, most of the delay is
+on the phone (exposure, ISP, encoder) plus one 33 ms frame interval and the monitor refresh.
+
 ## Consequences for the app
 
 - **Capabilities must be discovered at runtime.** Frame rates, stabilisation and lenses differ completely between devices.

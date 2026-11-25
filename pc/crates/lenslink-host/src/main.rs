@@ -2,6 +2,7 @@
 
 mod adb;
 mod stream;
+mod video;
 
 use std::process::ExitCode;
 
@@ -38,7 +39,7 @@ fn main() -> ExitCode {
 fn usage() {
     eprintln!("usage: lenslink-host <command> [options]");
     eprintln!();
-    eprintln!("  stream [options]           stream the phone camera to an ffplay window and/or a file");
+    eprintln!("  stream [options]           stream the phone camera to a window and/or a file");
     eprintln!("  probe [-s <id>] [--json]   print the camera report saved by the LensLink app");
     eprintln!("  version                    print versions");
     eprintln!();
