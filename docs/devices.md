@@ -16,6 +16,16 @@ What the camera probe found on real phones. Raw reports live in `reports/` (not 
 | HW encoders | H.264 (VBR only), H.265 (VBR/CBR), up to 4096×2160 | H.264, H.265 incl. Main10/HDR10+, VBR/CBR, up to 8K; AV1 software only |
 | Min focus distance | not reported | not reported |
 
+## Measured streaming (step 2)
+
+| Device | Mode | Result |
+|---|---|---|
+| Redmi Note 8T | 1080p30 H.264, 20 Mbit/s requested | steady 30.0 fps, 33 ms frame spacing, 11–21 Mbit/s (VBR only), no B-frames, High profile |
+
+Glass-to-glass latency (`tools/latency.html`, phone filming the clock, ffplay window next to it,
+4 screenshots): **≈ 200–250 ms**, Note 8T, 1080p30.
+Before `-thread_type slice` in ffplay it was ≈ 0.5–1 s: FFmpeg frame threading queued one frame per CPU thread.
+
 ## Consequences for the app
 
 - **Capabilities must be discovered at runtime.** Frame rates, stabilisation and lenses differ completely between devices.

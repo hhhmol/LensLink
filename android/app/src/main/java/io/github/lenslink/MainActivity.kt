@@ -1,8 +1,10 @@
-package io.github.lenslink.probe
+package io.github.lenslink
 
+import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
@@ -14,36 +16,43 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import io.github.lenslink.probe.CameraProbe
+import io.github.lenslink.probe.EncoderProbe
+import io.github.lenslink.probe.ReportText
+import io.github.lenslink.stream.StreamService
 import org.json.JSONObject
 import java.io.File
 import kotlin.concurrent.thread
 
 /**
- * Step 1 of the roadmap: shows what this phone's cameras and encoders can do and saves
- * the report to app-specific storage, where `adb` (and `lenslink-host probe`) can read it.
+ * Starts / stops the streaming service and shows the camera probe report.
+ * The report is also saved where `lenslink-host probe` reads it.
  */
-class ProbeActivity : Activity() {
+class MainActivity : Activity() {
 
     private lateinit var output: TextView
+    private lateinit var toggle: Button
     private var reportText: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val pad = (12 * resources.displayMetrics.density).toInt()
+        toggle = Button(this).apply { setOnClickListener { onToggle() } }
+        val copy = Button(this).apply {
+            text = "Copy camera report"
+            setOnClickListener { copyReport() }
+        }
         output = TextView(this).apply {
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextIsSelectable(true)
             text = "Collecting camera information..."
         }
-        val copy = Button(this).apply {
-            text = "Copy report"
-            setOnClickListener { copyReport() }
-        }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
+            addView(toggle)
             addView(copy)
             addView(output)
         }
@@ -53,7 +62,7 @@ class ProbeActivity : Activity() {
 
         thread(name = "lenslink-probe") {
             val text = try {
-                collect()
+                collectReport()
             } catch (e: Exception) {
                 Log.e(TAG, "probe failed", e)
                 "Probe failed:\n" + Log.getStackTraceString(e)
@@ -65,7 +74,47 @@ class ProbeActivity : Activity() {
         }
     }
 
-    private fun collect(): String {
+    override fun onResume() {
+        super.onResume()
+        updateToggle()
+    }
+
+    private fun onToggle() {
+        if (StreamService.running) {
+            StreamService.stop(this)
+            toggle.postDelayed({ updateToggle() }, 300)
+            return
+        }
+        val missing = requiredPermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) startStreaming() else requestPermissions(missing.toTypedArray(), REQUEST_PERMISSIONS)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_PERMISSIONS) return
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            startStreaming()
+        } else {
+            Toast.makeText(this, "LensLink needs camera access to stream", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startStreaming() {
+        StreamService.start(this)
+        toggle.postDelayed({ updateToggle() }, 300)
+    }
+
+    private fun updateToggle() {
+        toggle.text = if (StreamService.running) "Stop streaming service" else "Start streaming service"
+    }
+
+    private fun requiredPermissions(): List<String> {
+        val list = mutableListOf(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= 33) list += Manifest.permission.POST_NOTIFICATIONS
+        return list
+    }
+
+    private fun collectReport(): String {
         val device = JSONObject()
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
@@ -81,11 +130,9 @@ class ProbeActivity : Activity() {
             .put("encoders", EncoderProbe.run())
         val text = ReportText.render(report)
 
-        val dir = getExternalFilesDir(null)
-        if (dir != null) {
+        getExternalFilesDir(null)?.let { dir ->
             File(dir, "camera-report.json").writeText(report.toString(2))
             File(dir, "camera-report.txt").writeText(text)
-            Log.i(TAG, "report saved to ${dir.absolutePath}")
         }
         return text
     }
@@ -97,7 +144,7 @@ class ProbeActivity : Activity() {
         Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
     }
 
-    /** Android 15 draws apps edge-to-edge; keep the text clear of the status and navigation bars. */
+    /** Android 15+ draws apps edge-to-edge; keep content clear of the system bars. */
     private fun applySystemBarPadding(view: View) {
         view.setOnApplyWindowInsetsListener { v, insets ->
             if (Build.VERSION.SDK_INT >= 30) {
@@ -114,5 +161,6 @@ class ProbeActivity : Activity() {
 
     private companion object {
         const val TAG = "LensLink"
+        const val REQUEST_PERMISSIONS = 1
     }
 }

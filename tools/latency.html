@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LensLink latency clock</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; }
+  body { display: grid; place-items: center; font-family: Consolas, "Cascadia Mono", monospace; }
+  #clock { font-size: 18vw; font-weight: 700; letter-spacing: 0.02em; font-variant-numeric: tabular-nums; }
+  p { position: fixed; bottom: 1rem; width: 100%; text-align: center; color: #888; font-size: 1.1rem; margin: 0; }
+</style>
+</head>
+<body>
+<div id="clock">0000</div>
+<p>Point the phone at this number and put the LensLink window next to it.
+Latency = this number − the number shown in the LensLink window.</p>
+<script>
+  // Milliseconds modulo 10 s, redrawn every display frame.
+  const el = document.getElementById("clock");
+  const t0 = performance.now();
+  function tick(now) {
+    el.textContent = String(Math.floor(now - t0) % 10000).padStart(4, "0");
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>
+</body>
+</html>
