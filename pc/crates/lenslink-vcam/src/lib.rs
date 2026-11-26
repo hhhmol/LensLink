@@ -10,12 +10,14 @@
 
 #![allow(non_snake_case)] // COM method names
 
+pub mod controls;
 pub mod modes;
 pub mod shm;
 
 mod activator;
 mod attrs;
 mod dll;
+mod ks;
 mod log;
 mod source;
 mod stream;

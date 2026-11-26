@@ -71,8 +71,8 @@ playing the stream into a user-installed virtual cable.
 2. **Stream MVP** — phone streams H.264 over ADB; PC saves it / plays it with `ffplay`. Measure latency. ✓
 3. **Rust host** — protocol, GPU decode (Media Foundation + DXVA), preview window (D3D11 video processor). ✓
 4. **Virtual camera** — Media Foundation media source + `MFCreateVirtualCamera`. ✓
-5. **Controls** — a) video modes from the phone, chosen by apps ✓; b) lens, focus, exposure, ISO, WB. ← next
-6. **Filters** — shader filters, then segmentation, then interpolation.
+5. **Controls** — a) video modes from the phone, chosen by apps ✓; b) lens/zoom, focus, exposure, ISO, WB as standard camera properties ✓
+6. **Filters** — shader filters, then segmentation, then interpolation. ← next
 7. **Polish** — auto-reconnect, autostart, installer, battery/thermal guards on the phone.
 
 ## Virtual camera internals (step 4)
@@ -88,6 +88,14 @@ playing the stream into a user-installed virtual cable.
   `C:\ProgramData\LensLink\config\modes.txt` before creating the camera. The source offers one media
   type per mode. When an app starts the stream, the source stores the selected type in shared memory;
   the host sends the phone a new `start` and recreates its decoder.
+- Controls (step 5b): the host derives ranges from the capability report (zoom ratio range, AF modes,
+  exposure and ISO ranges when the camera has MANUAL_SENSOR, EV range, AWB presets) and writes them to
+  `controls.txt` next to `modes.txt`. The source answers `IKsControl` property requests for the
+  standard `PROPSETID_VIDCAP_CAMERACONTROL` (zoom, exposure, focus) and `PROPSETID_VIDCAP_VIDEOPROCAMP`
+  (brightness = EV compensation, gain = ISO, white balance, power-line frequency) sets: BASICSUPPORT,
+  DEFAULTVALUES, GET, SET. A SET stores the value in a shared-memory table and bumps a counter; the host
+  sends the phone a `set` with all current values. Windows Settings shows sliders for zoom and
+  brightness; apps with a full camera property dialog reach the rest.
 - Shared memory and its event live in `Global\`. Only a service may create global objects, so the
   camera side creates them with an ACL for interactive users; the host opens them while an app has the
   camera open and drops frames cheaply otherwise.

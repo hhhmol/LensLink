@@ -13,6 +13,8 @@ class Session(private val context: Context, private val socket: LocalSocket) {
 
     private val writer = PacketWriter(socket.outputStream)
     private var streamer: CameraStreamer? = null
+    // Survive mode switches: a new `start` keeps the settings made with `set`.
+    private var controls = Controls()
 
     fun run() {
         try {
@@ -39,7 +41,11 @@ class Session(private val context: Context, private val socket: LocalSocket) {
             "start" -> {
                 streamer?.stop()
                 val config = StreamConfig.from(msg)
-                streamer = CameraStreamer(context, config, writer, ::onStreamFailed).also { it.start() }
+                streamer = CameraStreamer(context, config, writer, controls, ::onStreamFailed).also { it.start() }
+            }
+            "set" -> {
+                controls = controls.merge(msg)
+                streamer?.update(controls)
             }
             "stop" -> {
                 streamer?.stop()

@@ -1,7 +1,7 @@
 //! The media source: one live NV12 video stream offering every mode the phone supports.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE};
@@ -12,7 +12,8 @@ use windows_core::{implement, ComObject, Interface, IUnknown, Ref, Result, BOOL,
 use crate::attrs::{forward_attributes, raw};
 use crate::log::vlog;
 use crate::modes::{self, Mode};
-use crate::stream::{forward_events, no_ks_properties, Stream};
+use crate::{controls, ks};
+use crate::stream::{forward_events, Stream};
 
 #[implement(IMFMediaSourceEx, IMFGetService, IKsControl, IMFAttributes)]
 pub struct Source {
@@ -21,6 +22,7 @@ pub struct Source {
     descriptor: IMFPresentationDescriptor,
     stream: Mutex<Option<ComObject<Stream>>>,
     announced: AtomicBool,
+    controls: OnceLock<ks::Controls>,
 }
 
 impl Source {
@@ -49,10 +51,14 @@ impl Source {
                 descriptor: pd,
                 stream: Mutex::new(None),
                 announced: AtomicBool::new(false),
+                controls: OnceLock::new(),
             });
             let stream = ComObject::new(Stream::new(sd, stream_attrs, modes[0])?);
             let ex: IMFMediaSourceEx = source.to_interface();
             stream.set_source(ex.cast()?);
+            let descs = controls::read();
+            vlog!("controls: {}", descs.iter().map(|d| d.control.name()).collect::<Vec<_>>().join(" "));
+            let _ = source.controls.set(ks::Controls::new(descs, stream.frames()));
             *source.stream.lock().unwrap() = Some(stream);
             vlog!("source created");
             Ok(source.to_interface())
@@ -105,7 +111,21 @@ fn current_mode(sd: &IMFStreamDescriptor) -> Result<Mode> {
 
 forward_attributes!(Source_Impl, attrs);
 forward_events!(Source_Impl, queue);
-no_ks_properties!(Source_Impl);
+impl IKsControl_Impl for Source_Impl {
+    fn KsProperty(&self, property: *const KSIDENTIFIER, plen: u32, data: *mut core::ffi::c_void, dlen: u32, returned: *mut u32) -> Result<()> {
+        let stream = self.stream()?;
+        let controls = self.controls.get().ok_or(windows_core::Error::from(MF_E_SHUTDOWN))?;
+        unsafe { controls.property(stream.frames(), property as *const _, plen, data, dlen, returned) }
+    }
+
+    fn KsMethod(&self, _: *const KSIDENTIFIER, _: u32, _: *mut core::ffi::c_void, _: u32, _: *mut u32) -> Result<()> {
+        Err(HRESULT::from_win32(windows::Win32::Foundation::ERROR_SET_NOT_FOUND.0).into())
+    }
+
+    fn KsEvent(&self, _: *const KSIDENTIFIER, _: u32, _: *mut core::ffi::c_void, _: u32, _: *mut u32) -> Result<()> {
+        Err(HRESULT::from_win32(windows::Win32::Foundation::ERROR_SET_NOT_FOUND.0).into())
+    }
+}
 
 impl IMFMediaSource_Impl for Source_Impl {
     fn GetCharacteristics(&self) -> Result<u32> {

@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaCodec
@@ -29,6 +30,7 @@ class CameraStreamer(
     context: Context,
     private val config: StreamConfig,
     private val writer: PacketWriter,
+    initialControls: Controls,
     private val onFatal: (Throwable) -> Unit,
 ) {
     private val manager = context.getSystemService(CameraManager::class.java)
@@ -42,6 +44,12 @@ class CameraStreamer(
     private var session: CameraCaptureSession? = null
     private var buffer = ByteArray(1 shl 20)
 
+    /** Only touched on the camera thread. */
+    private var controls = initialControls
+    /** Last values chosen by auto-exposure; the start point when only one manual value is given. */
+    private var lastExposureNs = 1_000_000_000L / 60
+    private var lastIso = 400
+
     @Volatile
     private var stopped = false
 
@@ -49,6 +57,23 @@ class CameraStreamer(
         handler.post {
             try {
                 open()
+            } catch (e: Exception) {
+                fail(e)
+            }
+        }
+    }
+
+    /** Applies new settings to the running stream; safe from any thread. */
+    fun update(c: Controls) {
+        handler.post {
+            controls = c
+            val device = camera
+            val surface = inputSurface
+            val s = session
+            if (stopped || device == null || surface == null || s == null) return@post
+            try {
+                s.setRepeatingRequest(buildRequest(device, surface), captureCallback, handler)
+                Log.i(TAG, "controls: $c")
             } catch (e: Exception) {
                 fail(e)
             }
@@ -150,7 +175,7 @@ class CameraStreamer(
                 if (stopped) return
                 session = s
                 try {
-                    s.setRepeatingRequest(buildRequest(device, surface), null, handler)
+                    s.setRepeatingRequest(buildRequest(device, surface), captureCallback, handler)
                     Log.i(TAG, "camera ${config.cameraId} streaming")
                 } catch (e: Exception) {
                     fail(e)
@@ -177,11 +202,6 @@ class CameraStreamer(
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, pickFpsRange(ch))
 
-            val afModes = ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-            if (afModes?.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO) == true) {
-                set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-            }
-
             if (config.stabilization) {
                 val eis = ch.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
                 if (eis?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true) {
@@ -193,12 +213,92 @@ class CameraStreamer(
                 }
             }
 
-            val zoom = config.zoom
-            if (zoom != null && Build.VERSION.SDK_INT >= 30) {
-                val range = ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
-                set(CaptureRequest.CONTROL_ZOOM_RATIO, range?.clamp(zoom) ?: zoom)
-            }
+            applyControls(this, ch)
         }.build()
+    }
+
+    private fun applyControls(b: CaptureRequest.Builder, ch: CameraCharacteristics) {
+        val c = controls
+
+        val zoom = c.zoom ?: config.zoom
+        if (zoom != null && Build.VERSION.SDK_INT >= 30) {
+            val range = ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, range?.clamp(zoom) ?: zoom)
+        }
+
+        val afModes = ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
+        val focus = c.focusDiopters
+        if (focus != null && afModes.contains(CameraMetadata.CONTROL_AF_MODE_OFF)) {
+            // Xiaomi does not report the minimum focus distance; 10 diopters (10 cm) is a safe ceiling.
+            val nearest = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)?.takeIf { it > 0f } ?: 10f
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+            b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focus.coerceIn(0f, nearest))
+        } else if (afModes.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)) {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        }
+
+        val manualSensor = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        if (manualSensor && (c.exposureNs != null || c.iso != null)) {
+            // Exposure longer than a frame would lower the frame rate.
+            val frameNs = 1_000_000_000L / config.fps
+            val expRange = ch.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            val isoRange = ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            var exposure = (c.exposureNs ?: lastExposureNs).coerceAtMost(frameNs)
+            if (expRange != null) exposure = expRange.clamp(exposure)
+            val iso = c.iso ?: lastIso
+            b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure)
+            b.set(CaptureRequest.SENSOR_SENSITIVITY, isoRange?.clamp(iso) ?: iso)
+            b.set(CaptureRequest.SENSOR_FRAME_DURATION, frameNs)
+        } else {
+            b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            val step = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat()
+            val range = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+            if (step != null && step > 0f && range != null) {
+                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, range.clamp(Math.round(c.ev / step)))
+            }
+        }
+
+        val antibanding = when (c.antibanding) {
+            "off" -> CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_OFF
+            "50hz" -> CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_50HZ
+            "60hz" -> CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_60HZ
+            else -> CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO
+        }
+        if (ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES)?.contains(antibanding) == true) {
+            b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, antibanding)
+        }
+
+        val awbModes = ch.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: IntArray(0)
+        b.set(CaptureRequest.CONTROL_AWB_MODE, awbPreset(c.awbKelvin, awbModes))
+
+        if (ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true) {
+            b.set(CaptureRequest.FLASH_MODE,
+                if (c.torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
+        }
+    }
+
+    /** Nearest white-balance preset to a colour temperature; auto when none fits. */
+    private fun awbPreset(kelvin: Int?, available: IntArray): Int {
+        if (kelvin == null) return CameraMetadata.CONTROL_AWB_MODE_AUTO
+        val presets = listOf(
+            2700 to CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT,
+            3000 to CameraMetadata.CONTROL_AWB_MODE_WARM_FLUORESCENT,
+            4000 to CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT,
+            5500 to CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT,
+            6500 to CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT,
+            7500 to CameraMetadata.CONTROL_AWB_MODE_SHADE,
+        ).filter { available.contains(it.second) }
+        return presets.minByOrNull { Math.abs(it.first - kelvin) }?.second ?: CameraMetadata.CONTROL_AWB_MODE_AUTO
+    }
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            if (result.get(TotalCaptureResult.CONTROL_AE_MODE) == CameraMetadata.CONTROL_AE_MODE_OFF) return
+            result.get(TotalCaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExposureNs = it }
+            result.get(TotalCaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
+        }
     }
 
     /** Prefer a fixed [fps, fps] range so the encoder gets a steady frame rate. */

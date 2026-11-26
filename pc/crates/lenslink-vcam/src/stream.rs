@@ -197,6 +197,10 @@ impl Stream {
         vlog!("app selected {mode}");
     }
 
+    pub fn frames(&self) -> Option<&SharedFrames> {
+        self.shared.frames.as_ref()
+    }
+
     pub fn attributes(&self) -> IMFAttributes {
         self.attrs.clone()
     }
@@ -329,6 +333,5 @@ macro_rules! no_ks_properties {
         }
     };
 }
-pub(crate) use no_ks_properties;
 
 no_ks_properties!(Stream_Impl);

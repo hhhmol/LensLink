@@ -106,6 +106,26 @@ the mode unless `--bitrate` is given. `--size`/`--fps` pick the default mode.
 Without a phone stream it shows dark grey. `cargo run --release -p lenslink-vcam --example grab -- 90 out.pgm 3840x2160@30`
 opens the camera like an app, lists its modes, selects one and reports the frame rate it receives.
 
+### Camera controls
+
+The camera exposes the phone's own controls as standard Windows camera properties, changed live
+without restarting the stream:
+
+| Windows property | Phone setting |
+|---|---|
+| Zoom | zoom ratio ×10 (10 = 1×); below 10 picks the ultrawide lens where there is one |
+| Focus | continuous autofocus, or manual distance 0 (infinity) … 100 (10 cm) |
+| Exposure | auto, or manual 2^value seconds (−5 ≈ 1/32 s) |
+| Brightness | exposure compensation in tenths of EV |
+| Gain | auto, or manual ISO |
+| White balance | auto, or kelvin mapped to the nearest preset |
+| Power-line frequency | anti-flicker: off / 50 Hz / 60 Hz / auto |
+
+Windows Settings → Bluetooth & devices → Cameras → LensLink shows sliders for zoom and brightness.
+Apps with a full camera property dialog (e.g. OBS "Configure Video") reach the rest, and
+`cargo run --release -p lenslink-vcam --example controls -- zoom=20 exposure=-7 gain=800` lists and
+sets them from the command line.
+
 ## License
 
 MIT

@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use lenslink_vcam::controls::{Control, ControlDesc};
 use lenslink_vcam::modes::Mode;
 use lenslink_vcam::shm::SharedFrames;
 use windows::core::{Interface, HSTRING};
@@ -24,6 +25,7 @@ pub struct VirtualCamera {
     frames: Option<SharedFrames>,
     next_try: Instant,
     last_request: Option<Mode>,
+    last_controls_seq: u64,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     video_device: ID3D11VideoDevice,
@@ -72,6 +74,7 @@ impl VirtualCamera {
             frames: None,
             next_try: Instant::now(),
             last_request: None,
+            last_controls_seq: 0,
             device: device.clone(),
             video_device: device.cast().map_err(gpu)?,
             video_context: context.cast().map_err(gpu)?,
@@ -95,6 +98,22 @@ impl VirtualCamera {
         }
         self.last_request = Some(r);
         Some(r)
+    }
+
+    /// Current values of `descs` after an app changed a control, once per change. Also fires when the
+    /// host attaches to a camera whose controls an app changed earlier.
+    pub fn take_controls(&mut self, descs: &[ControlDesc]) -> Option<Vec<(Control, i32, u32)>> {
+        let f = self.frames.as_ref()?;
+        let seq = f.controls_seq();
+        if seq == self.last_controls_seq {
+            return None;
+        }
+        self.last_controls_seq = seq;
+        Some(descs.iter().map(|d| {
+            let (v, flags) = f.control(d.control);
+            let (v, flags) = d.sanitize(v, flags);
+            (d.control, v, flags)
+        }).collect())
     }
 
     /// The phone now streams `picture`-sized frames; publish `output`-sized ones.

@@ -13,6 +13,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 pub use crate::stream::Codec;
 use decoder::Decoder;
+use lenslink_vcam::controls::{Control, ControlDesc};
 use lenslink_vcam::modes::Mode;
 use preview::Preview;
 use vcam::VirtualCamera;
@@ -55,6 +56,7 @@ pub struct Viewer {
     decoder: Decoder,
     preview: Option<Preview>,
     camera: Option<VirtualCamera>,
+    controls: Vec<ControlDesc>,
 }
 
 pub struct Outputs {
@@ -88,7 +90,7 @@ impl Viewer {
         } else {
             None
         };
-        Ok(Viewer { device, codec, mode, decoder, preview, camera })
+        Ok(Viewer { device, codec, mode, decoder, preview, camera, controls: Vec::new() })
     }
 
     /// Returns false once the user closed the window.
@@ -99,6 +101,17 @@ impl Viewer {
     /// A mode an app selected on the virtual camera, once per change.
     pub fn take_request(&mut self) -> Option<Mode> {
         self.camera.as_mut()?.take_request()
+    }
+
+    /// The controls offered on the virtual camera.
+    pub fn set_controls(&mut self, controls: Vec<ControlDesc>) {
+        self.controls = controls;
+    }
+
+    /// All control values after an app changed one, once per change.
+    pub fn take_controls(&mut self) -> Option<Vec<(Control, i32, u32)>> {
+        let descs = &self.controls;
+        self.camera.as_mut()?.take_controls(descs)
     }
 
     /// The phone is switching to `mode`: a fresh decoder for the new stream, new output sizes.

@@ -6,7 +6,7 @@
 //! is in use. Two frame slots: the host fills the one the camera is not reading, then publishes it.
 //! The camera writes back the mode the app chose, and the host switches the phone to it.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use windows::core::{w, Error, Result, HSTRING};
 use windows::Win32::Foundation::{
@@ -23,6 +23,7 @@ use windows::Win32::System::Threading::{
     CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
 };
 
+use crate::controls::{Control, MAX_CONTROLS};
 use crate::modes::Mode;
 
 /// Largest frame a slot holds (NV12): DCI 4K, or UHD with room to spare.
@@ -33,7 +34,7 @@ const SLOT_BYTES: usize = (MAX_WIDTH * MAX_HEIGHT * 3 / 2) as usize;
 const MAPPING_NAME: &str = "Global\\LensLinkVirtualCamera";
 const EVENT_NAME: &str = "Global\\LensLinkVirtualCameraFrame";
 const MAGIC: u32 = u32::from_le_bytes(*b"LLVC");
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_BYTES: usize = 4096;
 const TOTAL_BYTES: usize = HEADER_BYTES + 2 * SLOT_BYTES;
 
@@ -54,6 +55,11 @@ struct Header {
     slot_mode: [AtomicU64; 2],
     /// Mode the app selected, [`Mode::pack`]; 0 = none yet.
     requested: AtomicU64,
+    /// Bumped by the camera after an app changed a control.
+    controls_seq: AtomicU64,
+    /// Current value and `FLAG_AUTO`/`FLAG_MANUAL` per [`crate::controls::Control::index`].
+    control_value: [AtomicI32; MAX_CONTROLS],
+    control_flags: [AtomicU32; MAX_CONTROLS],
 }
 
 pub struct SharedFrames {
@@ -217,7 +223,30 @@ impl SharedFrames {
     pub fn requested(&self) -> Option<Mode> {
         Mode::unpack(self.header().requested.load(Ordering::Acquire))
     }
+
+    /// Changes to controls so far; 0 = none since the camera was created.
+    pub fn controls_seq(&self) -> u64 {
+        self.header().controls_seq.load(Ordering::Acquire)
+    }
+
+    /// Value and flags of a control (flags 0 = never set).
+    pub fn control(&self, c: Control) -> (i32, u32) {
+        let h = self.header();
+        (h.control_value[c.index()].load(Ordering::Acquire), h.control_flags[c.index()].load(Ordering::Acquire))
+    }
+
+    /// Camera: stores a control; `changed` tells the host to apply it.
+    pub fn set_control(&self, c: Control, value: i32, flags: u32, changed: bool) {
+        let h = self.header();
+        h.control_value[c.index()].store(value, Ordering::Release);
+        h.control_flags[c.index()].store(flags, Ordering::Release);
+        if changed {
+            h.controls_seq.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
+
+const _: () = assert!(size_of::<Header>() <= HEADER_BYTES);
 
 impl Drop for SharedFrames {
     fn drop(&mut self) {

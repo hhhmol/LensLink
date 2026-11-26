@@ -41,9 +41,24 @@ Payload is a UTF-8 JSON object with a `type` field. Unknown types and fields are
 | `capabilities` | phone → PC | the camera probe report (see `android/.../probe`) |
 | `start` | PC → phone | `camera_id`, `width`, `height`, `fps`, `codec` (`h264`/`h265`), `bitrate` |
 | `stop` | PC → phone | — |
-| `set` | PC → phone | camera parameters, e.g. `{"af_mode":"continuous_video","iso":200}` |
+| `set` | PC → phone | live camera settings, see below; kept across `start` |
 | `stats` | phone → PC | fps, bitrate, encoder queue, temperature, battery |
 | `error` | both | `message` |
+
+### `set`
+
+Only the keys present change; `null` returns a setting to automatic. Applied to the running stream
+without restarting it, and kept when a new `start` switches the mode.
+
+| key | value |
+|---|---|
+| `zoom` | logical-camera zoom ratio; below 1 selects the ultrawide lens on multi-camera phones |
+| `focus_diopters` | manual focus distance (1/m, 0 = infinity); `null` = continuous autofocus |
+| `exposure_ns`, `iso` | manual exposure; either one turns auto-exposure off, the other keeps its last auto value. Exposure is capped at one frame |
+| `ev` | exposure compensation in EV (rounded to the camera's step) |
+| `awb_kelvin` | white balance; the nearest preset (incandescent … shade) is used; `null` = auto |
+| `antibanding` | `auto`, `50hz`, `60hz`, `off` |
+| `torch` | `true` / `false` |
 
 ### Video (kind 1)
 

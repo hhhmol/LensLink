@@ -11,7 +11,7 @@ use lenslink_protocol::{self as proto, flags, Kind, ProtocolError};
 use serde_json::{json, Value};
 
 use crate::adb;
-use crate::modes;
+use crate::{controls, modes};
 use crate::video::{self, Viewer};
 use lenslink_vcam::modes::Mode;
 
@@ -184,6 +184,7 @@ fn stream(o: &Options) -> Result<(), String> {
     }
 
     let mut mode = Mode { width: o.width, height: o.height, fps: o.fps };
+    let mut camera_controls = Vec::new();
     if o.virtual_camera {
         // The camera offers apps the modes this phone camera supports.
         send_control(&mut writer, &json!({ "type": "get_capabilities" }))?;
@@ -204,6 +205,13 @@ fn stream(o: &Options) -> Result<(), String> {
             )
         })?;
         eprintln!("camera modes: {}", list.iter().map(Mode::to_string).collect::<Vec<_>>().join(", "));
+        camera_controls = controls::from_capabilities(&caps, &o.camera);
+        lenslink_vcam::controls::write(&camera_controls)
+            .map_err(|e| format!("cannot write {} ({e})", lenslink_vcam::controls::CONTROLS_PATH))?;
+        eprintln!(
+            "camera controls: {}",
+            camera_controls.iter().map(|d| d.control.name()).collect::<Vec<_>>().join(", ")
+        );
     }
     send_control(&mut writer, &start_message(o, mode))?;
 
@@ -218,7 +226,9 @@ fn stream(o: &Options) -> Result<(), String> {
     let mut viewer = if o.player == Player::Window || o.virtual_camera {
         video::init()?;
         let outputs = video::Outputs { window: o.player == Player::Window, virtual_camera: o.virtual_camera };
-        Some(Viewer::new(o.codec, mode, outputs)?)
+        let mut v = Viewer::new(o.codec, mode, outputs)?;
+        v.set_controls(camera_controls);
+        Some(v)
     } else {
         None
     };
@@ -247,6 +257,11 @@ an app selected {requested}: switching the phone");
                     mode = requested;
                     send_control(&mut writer, &start_message(o, mode))?;
                     v.set_mode(mode).map_err(|e| format!("switching to {mode}: {e}"))?;
+                }
+                if let Some(values) = v.take_controls() {
+                    let msg = controls::to_phone(&values);
+                    eprintln!("\ncontrols from an app: {msg}");
+                    send_control(&mut writer, &msg)?;
                 }
             }
             let packet = match rx.recv_timeout(Duration::from_millis(5)) {
