@@ -27,8 +27,8 @@ impl Mode {
     pub fn is_valid(self) -> bool {
         (16..=crate::shm::MAX_WIDTH).contains(&self.width)
             && (16..=crate::shm::MAX_HEIGHT).contains(&self.height)
-            && self.width % 2 == 0
-            && self.height % 2 == 0
+            && self.width.is_multiple_of(2)
+            && self.height.is_multiple_of(2)
             && (1..=240).contains(&self.fps)
     }
 

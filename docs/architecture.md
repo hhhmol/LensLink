@@ -74,7 +74,7 @@ playing the stream into a user-installed virtual cable.
 5. **Controls** — a) video modes from the phone, chosen by apps ✓; b) lens/zoom, focus, exposure, ISO, WB as standard camera properties ✓
 6. **Filters** — shader filters, then segmentation, then interpolation.
 7. **Polish** ← now — a) auto-reconnect and autostart of the phone service ✓; b) stream only while an
-   app uses the camera, adb device events instead of polling; c) tray app with a settings window;
+   app uses the camera, adb device events instead of polling ✓; c) tray app with a settings window;
    d) installer; e) battery/thermal guards on the phone.
 
 ## Virtual camera internals (step 4)
@@ -122,3 +122,15 @@ handshake → stream until the socket closes or no video arrives for 5 s → ret
 - On reconnect the phone gets the mode the camera currently publishes (or the closest one it offers,
   preferring larger sizes, scaled on the GPU) and the control values apps set, which the phone
   forgets between sessions.
+
+## Idle cost (step 7b)
+
+- While an app streams from the virtual camera, its stream worker stamps a heartbeat into the shared
+  memory (header v4) every half frame interval. The host counts the camera as watched while the
+  heartbeat is under 1.5 s old; a window, ffplay or `--out` file always counts.
+- Unwatched for 5 s, the host sends the phone `stop`: the camera and encoder close, the session stays
+  connected. Watched again, it sends `start` with the current mode and the camera is back in ~1–2 s.
+  The phone holds its wake lock only while streaming.
+- Waiting for a phone uses one long-running `adb track-devices`, which pushes the device list on
+  change, instead of starting `adb devices` every second; without a window the host wakes every
+  100 ms (50 ms with a connected phone) to check for apps. Measured idle: 0.00 % CPU, 46 MB.

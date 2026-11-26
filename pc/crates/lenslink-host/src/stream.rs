@@ -164,6 +164,10 @@ const AUTOSTART: &str = "io.github.lenslink/.AutostartActivity";
 const LAUNCH_INTERVAL: Duration = Duration::from_secs(10);
 const STOPPED: &str = "streaming was stopped on the phone: tap \"Start streaming service\" in LensLink \
                        to continue";
+const IDLE: &str = "phone ready; its camera turns on when an app opens LensLink";
+/// The phone camera stays on this long after the last app stopped watching: apps often close and
+/// reopen the camera (switching modes, settings previews).
+const IDLE_GRACE: Duration = Duration::from_secs(5);
 /// A started stream that delivers nothing for this long is treated as lost.
 const STALL: Duration = Duration::from_secs(5);
 
@@ -192,6 +196,7 @@ pub fn run(o: &Options) -> Result<(), String> {
         app_selected: false,
         offered: Vec::new(),
         last_launch: None,
+        devices: None,
         user_stopped: false,
         said: String::new(),
     };
@@ -243,6 +248,7 @@ struct Host<'a> {
     /// Modes of the connected phone, as last written for the virtual camera.
     offered: Vec<Mode>,
     last_launch: Option<Instant>,
+    devices: Option<adb::DeviceWatch>,
     /// The user stopped streaming on the phone: do not start it again until the phone is reconnected
     /// or the user starts it there.
     user_stopped: bool,
@@ -261,6 +267,14 @@ impl Host<'_> {
         }
     }
 
+    /// Whether the video goes anywhere now. Without a window, file or player that depends on apps
+    /// using the virtual camera.
+    fn watched(&mut self) -> bool {
+        self.file.is_some()
+            || self.o.player == Player::Ffplay
+            || self.viewer.as_mut().is_some_and(Viewer::watched)
+    }
+
     /// Keeps the window responsive for `d`. False once the user closed it.
     fn idle(&mut self, d: Duration) -> bool {
         let until = Instant::now() + d;
@@ -273,7 +287,9 @@ impl Host<'_> {
                     self.select(r);
                 }
             }
-            std::thread::sleep(Duration::from_millis(15));
+            // A window needs its messages handled promptly; otherwise wake rarely.
+            let window = self.viewer.as_ref().is_some_and(Viewer::has_window);
+            std::thread::sleep(Duration::from_millis(if window { 15 } else { 100 }));
         }
         true
     }
@@ -291,7 +307,12 @@ impl Host<'_> {
     /// Serial of a phone ready for adb; None once the user closed the window.
     fn wait_for_phone(&mut self) -> Result<Option<String>, String> {
         loop {
-            let devices = adb::devices()?;
+            let Some(devices) = self.device_list()? else {
+                if !self.idle(Duration::from_millis(100)) {
+                    return Ok(None);
+                }
+                continue;
+            };
             let wanted = |s: &str| self.o.serial.as_deref().is_none_or(|w| w == s);
             let mine: Vec<_> = devices.iter().filter(|(s, _)| wanted(s)).collect();
             if let Some((serial, _)) = mine.iter().find(|(_, state)| state == "device") {
@@ -305,8 +326,26 @@ impl Host<'_> {
                 "waiting for the phone: connect it with USB (USB debugging on)"
             };
             self.say(text);
-            if !self.idle(Duration::from_secs(1)) {
+            if !self.idle(Duration::from_millis(250)) {
                 return Ok(None);
+            }
+        }
+    }
+
+    /// Devices from the running `adb track-devices` (restarted when adb quits); `None` until adb
+    /// reported. Falls back to `adb devices` if the watch cannot run.
+    fn device_list(&mut self) -> Result<Option<Vec<(String, String)>>, String> {
+        if self.devices.is_none() {
+            match adb::DeviceWatch::start() {
+                Ok(w) => self.devices = Some(w),
+                Err(_) => return adb::devices().map(Some),
+            }
+        }
+        match self.devices.as_mut().unwrap().devices() {
+            Ok(list) => Ok(list.map(<[_]>::to_vec)),
+            Err(()) => {
+                self.devices = None;
+                adb::devices().map(Some)
             }
         }
     }
@@ -354,9 +393,7 @@ impl Host<'_> {
                 v.set_controls(descs);
             }
         }
-        send_control(&mut writer, &start_message(o, phone_mode))?;
         if let Some(v) = self.viewer.as_mut() {
-            v.set_stream(phone_mode).map_err(Fail::Fatal)?;
             v.set_output(self.output);
             // The phone starts with automatic settings; restore what apps set.
             v.resend_controls();
@@ -376,36 +413,62 @@ impl Host<'_> {
         let result = (|| -> Result<End, Fail> {
             let mut stats = Stats::new();
             let mut last_video = Instant::now();
+            // The phone camera runs only while something shows the video.
+            let mut streaming = false;
+            let mut last_watched = Instant::now().checked_sub(IDLE_GRACE).unwrap_or_else(Instant::now);
+            if !self.watched() {
+                self.say(IDLE);
+            }
             loop {
                 if let Some(v) = self.viewer.as_mut() {
                     if !v.pump() {
                         return Ok(End::Quit);
                     }
                 }
+                let mut restart = false;
                 if let Some(r) = self.viewer.as_mut().and_then(Viewer::take_request) {
                     self.select(r);
                     let p = modes::closest(&self.offered, r);
-                    if p != phone_mode {
-                        phone_mode = p;
-                        send_control(&mut writer, &start_message(o, phone_mode))?;
-                        let v = self.viewer.as_mut().unwrap();
-                        v.set_stream(phone_mode).map_err(|e| Fail::Fatal(format!("switching to {p}: {e}")))?;
-                        last_video = Instant::now();
+                    restart = p != phone_mode;
+                    phone_mode = p;
+                }
+                if self.watched() {
+                    last_watched = Instant::now();
+                    restart |= !streaming;
+                }
+                if restart && last_watched.elapsed() < IDLE_GRACE {
+                    send_control(&mut writer, &start_message(o, phone_mode))?;
+                    if let Some(v) = self.viewer.as_mut() {
+                        v.set_stream(phone_mode).map_err(|e| Fail::Fatal(format!("starting {phone_mode}: {e}")))?;
                     }
+                    if !streaming {
+                        self.say("streaming");
+                    }
+                    streaming = true;
+                    last_video = Instant::now();
+                } else if streaming && last_watched.elapsed() >= IDLE_GRACE {
+                    send_control(&mut writer, &json!({ "type": "stop" }))?;
+                    streaming = false;
+                    if io::stderr().is_terminal() {
+                        eprintln!();
+                    }
+                    self.say(IDLE);
                 }
                 if let Some(values) = self.viewer.as_mut().and_then(Viewer::take_controls) {
                     let msg = controls::to_phone(&values);
                     eprintln!("controls: {msg}");
                     send_control(&mut writer, &msg)?;
                 }
-                let packet = match rx.recv_timeout(Duration::from_millis(5)) {
+                // Short waits keep the window responsive while streaming; idle, the loop barely runs.
+                let wait = if streaming { 5 } else { 50 };
+                let packet = match rx.recv_timeout(Duration::from_millis(wait)) {
                     Ok(Ok(Some(p))) => p,
                     Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
                         return Ok(End::Lost("the phone disconnected".into(), Duration::from_secs(1)))
                     }
                     Ok(Err(e)) => return Ok(End::Lost(format!("connection: {e}"), Duration::from_secs(1))),
                     Err(RecvTimeoutError::Timeout) => {
-                        if last_video.elapsed() > STALL {
+                        if streaming && last_video.elapsed() > STALL {
                             return Ok(End::Lost("no video from the phone for 5 s".into(), Duration::from_secs(1)));
                         }
                         continue;

@@ -134,6 +134,11 @@ fn worker(shared: Arc<Shared>) {
         if st.shutdown {
             return;
         }
+        if st.running {
+            if let Some(f) = &shared.frames {
+                f.heartbeat();
+            }
+        }
         let due = st.last_delivery.elapsed() >= st.interval();
         shared.serve(&mut st, due);
     }

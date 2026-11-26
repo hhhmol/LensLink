@@ -9,7 +9,12 @@ import io.github.lenslink.probe.EncoderProbe
 import org.json.JSONObject
 
 /** One connected PC. Blocks the calling thread until the PC disconnects. */
-class Session(private val context: Context, private val socket: LocalSocket) {
+class Session(
+    private val context: Context,
+    private val socket: LocalSocket,
+    /** Called with true when the camera starts streaming and false when it stops. */
+    private val onStreaming: (Boolean) -> Unit = {},
+) {
 
     private val writer = PacketWriter(socket.outputStream)
     private var streamer: CameraStreamer? = null
@@ -31,6 +36,7 @@ class Session(private val context: Context, private val socket: LocalSocket) {
             }
         } finally {
             streamer?.stop()
+            if (streamer != null) onStreaming(false)
             runCatching { socket.close() }
             Log.i(TAG, "PC disconnected")
         }
@@ -42,6 +48,7 @@ class Session(private val context: Context, private val socket: LocalSocket) {
                 streamer?.stop()
                 val config = StreamConfig.from(msg)
                 streamer = CameraStreamer(context, config, writer, controls, ::onStreamFailed).also { it.start() }
+                onStreaming(true)
             }
             "set" -> {
                 controls = controls.merge(msg)
@@ -50,6 +57,7 @@ class Session(private val context: Context, private val socket: LocalSocket) {
             "stop" -> {
                 streamer?.stop()
                 streamer = null
+                onStreaming(false)
             }
             "get_capabilities" -> writer.control(JSONObject()
                 .put("type", "capabilities")

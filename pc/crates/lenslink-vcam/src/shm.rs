@@ -4,7 +4,8 @@
 //! `Global\` namespace. Only a service may create global objects, so the camera side creates them
 //! (with an ACL that lets interactive users write) and the host opens them, retrying until the camera
 //! is in use. Two frame slots: the host fills the one the camera is not reading, then publishes it.
-//! The camera writes back the mode the app chose, and the host switches the phone to it.
+//! The camera writes back the mode the app chose, and the host switches the phone to it. While an app
+//! is streaming, the camera stamps a heartbeat, so the host can keep the phone's camera off otherwise.
 
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
@@ -34,7 +35,7 @@ const SLOT_BYTES: usize = (MAX_WIDTH * MAX_HEIGHT * 3 / 2) as usize;
 const MAPPING_NAME: &str = "Global\\LensLinkVirtualCamera";
 const EVENT_NAME: &str = "Global\\LensLinkVirtualCameraFrame";
 const MAGIC: u32 = u32::from_le_bytes(*b"LLVC");
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const HEADER_BYTES: usize = 4096;
 const TOTAL_BYTES: usize = HEADER_BYTES + 2 * SLOT_BYTES;
 
@@ -60,6 +61,8 @@ struct Header {
     /// Current value and `FLAG_AUTO`/`FLAG_MANUAL` per [`crate::controls::Control::index`].
     control_value: [AtomicI32; MAX_CONTROLS],
     control_flags: [AtomicU32; MAX_CONTROLS],
+    /// `GetTickCount64` of the camera's last heartbeat while an app streams; 0 = never.
+    consumer_ms: AtomicU64,
 }
 
 pub struct SharedFrames {
@@ -212,6 +215,19 @@ impl SharedFrames {
         }
         unsafe { std::ptr::copy_nonoverlapping(self.slot(slot), dst.as_mut_ptr(), m.frame_bytes()) };
         Some(seq)
+    }
+
+    /// Camera: an app is streaming right now.
+    pub fn heartbeat(&self) {
+        self.header().consumer_ms.store(unsafe { GetTickCount64() }, Ordering::Release);
+    }
+
+    /// Host: milliseconds since an app last streamed, `None` if none ever did.
+    pub fn consumer_age_ms(&self) -> Option<u64> {
+        match self.header().consumer_ms.load(Ordering::Acquire) {
+            0 => None,
+            t => Some(unsafe { GetTickCount64() }.saturating_sub(t)),
+        }
     }
 
     /// Camera: records the mode the app selected.

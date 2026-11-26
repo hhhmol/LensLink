@@ -28,7 +28,10 @@ Pre-alpha, steps 1–5 of the [roadmap](docs/architecture.md#roadmap) done, step
   an app switches the phone to it. The phone's zoom, focus, exposure, ISO and white balance appear
   as standard camera properties;
 - **automatic reconnection**: pull the cable, reboot the phone or stop the app, and streaming resumes
-  by itself once the phone is back. The window and the virtual camera stay up meanwhile.
+  by itself once the phone is back. The window and the virtual camera stay up meanwhile;
+- **camera on demand**: with `--vcam --no-play` the phone's camera runs only while an app shows
+  LensLink, and stops 5 s after the last one closes it. Idle, the host uses no measurable CPU and the
+  phone keeps no wake lock.
 
 Not yet: filters, a tray app, an installer.
 

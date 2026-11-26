@@ -1,7 +1,9 @@
 //! Thin wrapper over the `adb` command-line tool.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 /// `adb` from `ANDROID_HOME` when present, otherwise whatever is on PATH.
 pub fn path() -> PathBuf {
@@ -29,6 +31,62 @@ pub fn run(serial: Option<&str>, args: &[&str]) -> Result<Output, String> {
 pub fn devices() -> Result<Vec<(String, String)>, String> {
     let out = check(None, &["devices"])?;
     Ok(parse_devices(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `adb track-devices`: adb pushes the device list whenever it changes, so waiting for a phone costs
+/// nothing instead of starting `adb devices` every second.
+pub struct DeviceWatch {
+    child: Child,
+    rx: Receiver<Vec<(String, String)>>,
+    latest: Option<Vec<(String, String)>>,
+}
+
+impl DeviceWatch {
+    pub fn start() -> Result<Self, String> {
+        let mut child = Command::new(path())
+            .arg("track-devices")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot run adb ({e}); install Android platform-tools"))?;
+        let mut out = child.stdout.take().expect("stdout is piped");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Each message: four hex digits of length, then `serial\tstate` lines.
+            let mut len = [0u8; 4];
+            while out.read_exact(&mut len).is_ok() {
+                let Some(n) = std::str::from_utf8(&len).ok().and_then(|s| usize::from_str_radix(s, 16).ok()) else {
+                    return;
+                };
+                let mut body = vec![0; n];
+                if out.read_exact(&mut body).is_err() || tx.send(parse_devices(&String::from_utf8_lossy(&body))).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(DeviceWatch { child, rx, latest: None })
+    }
+
+    /// The newest device list; `None` until adb sent the first one. Err once adb quit (server killed,
+    /// adb updated): start a new watch.
+    pub fn devices(&mut self) -> Result<Option<&[(String, String)]>, ()> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(list) => self.latest = Some(list),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Err(()),
+            }
+        }
+        Ok(self.latest.as_deref())
+    }
+}
+
+impl Drop for DeviceWatch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn parse_devices(text: &str) -> Vec<(String, String)> {

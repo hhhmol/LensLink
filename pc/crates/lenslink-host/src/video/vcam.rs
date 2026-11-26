@@ -4,6 +4,7 @@
 //! on the GPU into an NV12 texture of the mode the app selected (letterboxed when the aspect ratio
 //! differs), read back, and published to the camera through shared memory. Frames are dropped cheaply
 //! while no app has the camera open, because then the camera side has not created the shared memory.
+//! [`VirtualCamera::in_use`] tells whether an app is streaming, so the phone can stay off otherwise.
 
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,8 @@ use windows::Win32::Media::MediaFoundation::*;
 use super::decoder::Frame;
 
 const RETRY: Duration = Duration::from_millis(500);
+/// The camera stamps its heartbeat every half frame interval while an app streams.
+const CONSUMER_TIMEOUT_MS: u64 = 1500;
 
 pub struct VirtualCamera {
     camera: IMFVirtualCamera,
@@ -90,6 +93,30 @@ impl VirtualCamera {
         self.frames.is_some()
     }
 
+    /// Whether an app is streaming from the camera right now.
+    pub fn in_use(&mut self) -> bool {
+        self.attach();
+        self.frames.as_ref().and_then(SharedFrames::consumer_age_ms).is_some_and(|age| age < CONSUMER_TIMEOUT_MS)
+    }
+
+    /// Opens the shared memory once the camera side created it; retried at most every [`RETRY`].
+    fn attach(&mut self) {
+        if self.frames.is_some() || Instant::now() < self.next_try {
+            return;
+        }
+        self.next_try = Instant::now() + RETRY;
+        match SharedFrames::open() {
+            Ok(f) => {
+                eprintln!("virtual camera: an app opened the camera");
+                self.frames = Some(f);
+            }
+            Err(e) if e.code() == windows::Win32::Foundation::E_UNEXPECTED => {
+                eprintln!("virtual camera: {}", e.message());
+            }
+            Err(_) => {}
+        }
+    }
+
     /// A mode an app newly selected, once per change.
     pub fn take_request(&mut self) -> Option<Mode> {
         let r = self.frames.as_ref()?.requested()?;
@@ -132,18 +159,9 @@ impl VirtualCamera {
     }
 
     pub fn push(&mut self, frame: &Frame) -> windows::core::Result<()> {
+        self.attach();
         if self.frames.is_none() {
-            if Instant::now() < self.next_try {
-                return Ok(());
-            }
-            self.next_try = Instant::now() + RETRY;
-            match SharedFrames::open() {
-                Ok(f) => {
-                    eprintln!("\nvirtual camera: an app opened the camera");
-                    self.frames = Some(f);
-                }
-                Err(_) => return Ok(()),
-            }
+            return Ok(());
         }
         unsafe {
             self.scale(frame)?;

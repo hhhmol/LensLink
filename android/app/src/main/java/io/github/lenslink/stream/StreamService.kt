@@ -90,10 +90,9 @@ class StreamService : Service() {
                     break
                 }
                 client = accepted
-                acquireWakeLock()
-                updateNotification("PC connected")
+                updateNotification(IDLE_TEXT)
                 try {
-                    Session(this, accepted).also { session = it }.run()
+                    Session(this, accepted, ::onStreaming).also { session = it }.run()
                 } catch (e: Exception) {
                     Log.w(TAG, "session ended: ${e.message}")
                 }
@@ -155,6 +154,13 @@ class StreamService : Service() {
         getSystemService(NotificationManager::class.java).notify(STOPPED_NOTIFICATION_ID, notification)
     }
 
+    /** The camera runs only while an app on the PC watches; so does the wake lock. */
+    private fun onStreaming(on: Boolean) {
+        if (closing) return
+        if (on) acquireWakeLock() else releaseWakeLock()
+        updateNotification(if (on) "Streaming to the PC" else IDLE_TEXT)
+    }
+
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         wakeLock = getSystemService(PowerManager::class.java)
@@ -172,6 +178,7 @@ class StreamService : Service() {
         private const val CHANNEL = "stream"
         private const val NOTIFICATION_ID = 1
         private const val STOPPED_NOTIFICATION_ID = 2
+        private const val IDLE_TEXT = "PC connected, camera off until an app uses it"
         private const val ACTION_STOP = "io.github.lenslink.STOP"
 
         @Volatile

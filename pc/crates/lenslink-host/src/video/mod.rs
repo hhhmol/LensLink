@@ -98,6 +98,15 @@ impl Viewer {
         self.preview.as_mut().is_none_or(Preview::pump)
     }
 
+    pub fn has_window(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    /// Whether anything shows the video now: the window, or an app streaming from the virtual camera.
+    pub fn watched(&mut self) -> bool {
+        self.preview.is_some() || self.camera.as_mut().is_some_and(VirtualCamera::in_use)
+    }
+
     /// A mode an app selected on the virtual camera, once per change.
     pub fn take_request(&mut self) -> Option<Mode> {
         self.camera.as_mut()?.take_request()
