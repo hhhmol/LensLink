@@ -4,11 +4,14 @@
 //! keeps a thick-frame style so Windows still gives it a shadow, rounded corners, snapping and
 //! maximising. It is moved by dragging anywhere on the video and resized at the corners: the edges
 //! are left free for the settings curtains that come next. Closing hides it in the tray.
+//!
+//! Drawing happens on demand: a new frame, the pointer, a status. While something animates, the
+//! loop draws once per display refresh, paced by the swap chain.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR, Result};
 use windows::Win32::Foundation::*;
@@ -18,13 +21,15 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::{MonitorFromRect, ValidateRect, MONITOR_DEFAULTTONULL};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::render::{button_at, Button, Renderer, Scene};
+use super::overlay::{button_at, Button, Input, Overlay};
+use super::render::{letterbox, Frame, Renderer};
 use super::{Com, Shared};
 use crate::settings::Settings;
 
@@ -40,6 +45,9 @@ pub const WM_APP_SHOW: u32 = WM_APP + 5;
 const LIVE: Duration = Duration::from_millis(1500);
 /// Corner area that resizes the window, in DIPs.
 const CORNER: i32 = 18;
+/// Timers: animation while Windows runs its own loop for moving and sizing; the end of live video.
+const TIMER_ANIMATE: usize = 1;
+const TIMER_LIVE: usize = 2;
 
 const MENU_SHOW: usize = 1;
 const MENU_EXIT: usize = 2;
@@ -56,13 +64,21 @@ struct Win {
     pressed: Option<Button>,
     /// Width / height of the video, kept when the window is resized.
     aspect: f32,
+    overlay: Overlay,
+    /// Something changed since the last frame.
+    dirty: bool,
+    /// The overlay is moving: keep drawing.
+    animating: bool,
+    last_step: Option<Instant>,
+    /// The modal loop Windows runs while the window is moved or sized is running instead of ours.
+    sizing: bool,
 }
 
 pub fn run(shared: Arc<Shared>, device: Com<ID3D11Device>, factory: Com<ID2D1Factory1>, hidden: bool, ready: Sender<std::result::Result<(), String>>) {
     match create(shared.clone(), &device.0, &factory.0, hidden) {
         Ok(win) => {
             let _ = ready.send(Ok(()));
-            message_loop();
+            message_loop(win.hwnd);
             drop(win);
         }
         Err(e) => {
@@ -73,12 +89,30 @@ pub fn run(shared: Arc<Shared>, device: Com<ID3D11Device>, factory: Com<ID2D1Fac
     shared.hwnd.store(0, Ordering::Release);
 }
 
-fn message_loop() {
+/// Messages, and a frame whenever one is due and the swap chain takes it.
+fn message_loop(hwnd: HWND) {
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        loop {
+            // The same pointer the window procedure uses; no reference outlives a dispatch.
+            let win = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Win;
+            if win.is_null() {
+                return;
+            }
+            let due = (*win).due();
+            let waitable = [(*win).renderer.waitable()];
+            let handles: &[HANDLE] = if due { &waitable } else { &[] };
+            let r = MsgWaitForMultipleObjectsEx(Some(handles), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if due && r == WAIT_OBJECT_0 {
+                (*win).draw();
+            }
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    return;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
@@ -138,6 +172,11 @@ fn create(shared: Arc<Shared>, device: &ID3D11Device, factory: &ID2D1Factory1, h
             mouse: None,
             pressed: None,
             aspect,
+            overlay: Overlay::default(),
+            dirty: true,
+            animating: false,
+            last_step: None,
+            sizing: false,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *win as *mut Win as isize);
         // Apply WM_NCCALCSIZE now that the state is in place.
@@ -193,7 +232,7 @@ impl Win {
             let _ = SetForegroundWindow(self.hwnd);
         }
         self.update_visible();
-        self.draw();
+        self.invalidate();
     }
 
     /// Into the tray: the phone's camera turns off unless an app uses the virtual camera.
@@ -271,26 +310,56 @@ impl Win {
         }
     }
 
+    /// A frame is wanted: drawn when the swap chain is ready (at once inside Windows' modal loop).
+    fn invalidate(&mut self) {
+        self.dirty = true;
+        if self.sizing {
+            self.draw();
+        }
+    }
+
+    fn due(&self) -> bool {
+        (self.dirty || self.animating) && self.shared.visible.load(Ordering::Acquire)
+    }
+
     fn draw(&mut self) {
+        self.dirty = false;
         if !self.shared.visible.load(Ordering::Acquire) {
+            self.animating = false;
+            self.last_step = None;
             return;
         }
-        let (width, _) = self.renderer.size();
-        let hot = self.mouse.and_then(|(x, y)| button_at(x, y, width));
+        let now = Instant::now();
+        let dt = self.last_step.map_or(1.0 / 60.0, |t| (now - t).as_secs_f32()).clamp(1.0 / 240.0, 1.0 / 30.0);
+        self.last_step = Some(now);
+
+        let size = self.renderer.size();
+        let pixels = self.renderer.pixels();
         let (video, status, live) = {
-            let st = self.shared.state();
+            let mut st = self.shared.state();
             let live = st.last_frame.is_some_and(|t| t.elapsed() < LIVE);
+            // Frames are scaled on the GPU to exactly the pixels the video covers.
+            let r = letterbox(st.size, pixels);
+            st.want = (r[2] as u32, r[3] as u32);
             (st.video.as_ref().map(|v| (v.0.clone(), st.size)), st.status.clone(), live)
         };
-        let scene = Scene {
-            video: video.as_ref().map(|(t, s)| (t, *s)),
-            status: &status,
-            live,
+        let over = self.mouse.and_then(|(x, y)| button_at(x, y, size.0));
+        let input = Input {
+            size,
             hover: self.mouse.is_some(),
-            hot,
-            pressed: self.pressed,
+            hot: if self.pressed.is_some() { self.pressed.filter(|&b| over == Some(b)) } else { over },
+            pressed: self.pressed.filter(|&b| over == Some(b)),
+            live,
+            status: &status,
         };
-        if let Err(e) = self.renderer.draw(&scene) {
+        let renderer = &self.renderer;
+        self.animating = self.overlay.step(dt, &input, |t, large, max| renderer.measure(t, large, max));
+        if !self.animating {
+            self.last_step = None;
+        }
+        let elements = self.overlay.elements(size);
+        let frame = Frame { video: video.as_ref().map(|(t, s)| (t, *s)), elements: &elements };
+        if let Err(e) = self.renderer.draw(&frame) {
             eprintln!("window: draw: {e}");
         }
     }
@@ -326,6 +395,7 @@ impl Win {
                         eprintln!("window: resize: {e}");
                     }
                     self.update_visible();
+                    // Straight away: Windows shows the new size as soon as this returns.
                     self.draw();
                 }
                 WM_DPICHANGED => {
@@ -344,7 +414,24 @@ impl Win {
                 }
                 WM_PAINT => {
                     let _ = ValidateRect(Some(self.hwnd), None);
-                    self.draw();
+                    self.invalidate();
+                }
+                WM_ENTERSIZEMOVE => {
+                    self.sizing = true;
+                    SetTimer(Some(self.hwnd), TIMER_ANIMATE, 15, None);
+                }
+                WM_EXITSIZEMOVE => {
+                    self.sizing = false;
+                    let _ = KillTimer(Some(self.hwnd), TIMER_ANIMATE);
+                }
+                WM_TIMER if wparam.0 == TIMER_ANIMATE => {
+                    if self.due() {
+                        self.draw();
+                    }
+                }
+                WM_TIMER if wparam.0 == TIMER_LIVE => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_LIVE);
+                    self.invalidate();
                 }
                 WM_MOUSEMOVE => {
                     if self.mouse.is_none() {
@@ -361,12 +448,12 @@ impl Win {
                     let before = self.mouse.map(|(x, y)| button_at(x, y, width));
                     self.mouse = Some(p);
                     if before != Some(button_at(p.0, p.1, width)) {
-                        self.draw();
+                        self.invalidate();
                     }
                 }
                 WM_MOUSELEAVE => {
                     self.mouse = None;
-                    self.draw();
+                    self.invalidate();
                 }
                 WM_LBUTTONDOWN => {
                     let (x, y) = self.point(lparam);
@@ -374,7 +461,7 @@ impl Win {
                     if let Some(b) = button_at(x, y, width) {
                         self.pressed = Some(b);
                         SetCapture(self.hwnd);
-                        self.draw();
+                        self.invalidate();
                     } else {
                         // Drag the window by the video.
                         let _ = ReleaseCapture();
@@ -394,7 +481,7 @@ impl Win {
                                 }
                             }
                         }
-                        self.draw();
+                        self.invalidate();
                     }
                 }
                 WM_LBUTTONDBLCLK => {
@@ -410,9 +497,11 @@ impl Win {
                 WM_APP_FRAME => {
                     self.shared.frame_pending.store(false, Ordering::Release);
                     self.follow_aspect();
-                    self.draw();
+                    // When frames stop, the status comes back to the middle.
+                    SetTimer(Some(self.hwnd), TIMER_LIVE, LIVE.as_millis() as u32 + 50, None);
+                    self.invalidate();
                 }
-                WM_APP_STATUS => self.draw(),
+                WM_APP_STATUS => self.invalidate(),
                 WM_APP_SHOW => self.show(),
                 WM_APP_EXIT => self.exit(),
                 WM_APP_TRAY => match (lparam.0 & 0xffff) as u32 {

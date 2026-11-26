@@ -75,7 +75,7 @@ playing the stream into a user-installed virtual cable.
 6. **Filters** — shader filters, then segmentation, then interpolation.
 7. **Polish** ← now — a) auto-reconnect and autostart of the phone service ✓; b) stream only while an
    app uses the camera, adb device events instead of polling ✓; c) the app: 1. tray, borderless
-   window, own window thread ✓; 2. liquid glass shader; 3. settings curtains; 4. widgets on the video;
+   window, own window thread ✓; 2. liquid glass shader ✓; 3. settings curtains; 4. widgets on the video;
    d) installer; e) battery/thermal guards on the phone.
 
 ## Virtual camera internals (step 4)
@@ -145,9 +145,10 @@ window (`ui` module), and the virtual camera when it is installed.
 - **Two threads.** The streaming thread (adb, socket, decoder, virtual camera) is the one from the
   console tool. The window has its own thread and message loop, so dragging or resizing never stalls
   the stream and a slow phone never stalls the window. They share the D3D11 device: the streaming
-  thread converts each frame to BGRA on the GPU video processor (inside the multithreaded Direct2D
-  factory's lock) and posts a message; the window draws the texture with Direct2D. Frames are
-  converted only while the window is on screen. Hiding it (×, Esc, Alt+F4) leaves the tray icon; the
+  thread converts each frame to BGRA on the GPU video processor, scaled straight to the pixels the
+  video covers in the window (inside the multithreaded Direct2D factory's lock, which the window
+  holds while it draws), and posts a message. Frames are converted only while the window is on
+  screen. Hiding it (×, Esc, Alt+F4) leaves the tray icon; the
   phone's camera then follows the virtual camera's use as in step 7b.
 - **Borderless.** `WM_NCCALCSIZE` gives the whole window to the client while the thick-frame style
   keeps Windows 11's shadow, rounded corners, snapping and maximising. Dragging anywhere moves the
@@ -158,5 +159,16 @@ window (`ui` module), and the virtual camera when it is installed.
   hide in four elastic curtains, one per edge, whose edge is a string of springs (waves, overshoot,
   bending towards the pointer); their text bends with them. Any item can be pulled onto the video as
   a floating widget. The prototypes are kept outside the repository.
+- **Glass in one pass.** `glass.hlsl` (compiled to bytecode by `build.rs` with the D3D compiler that
+  ships with Windows) draws the whole window in one triangle: the video, and the floating elements
+  and curtains as one signed distance field. Elements merge by a smooth minimum; inside the field
+  the picture is refracted by a drop-profile rim, split into nine colour samples, tinted and lit by
+  two highlights and a Fresnel rim. Labels are DirectWrite text drawn on top with Direct2D. Closed
+  curtains rest just outside the window, so nothing merges with an edge until a curtain is pulled.
+- **Drawn on demand.** A frame, the pointer or a status marks the window dirty; the window thread
+  waits on the swap chain's frame-latency object (one frame in flight) and draws when both agree.
+  Elements come and go on damped springs (a drop's small overshoot), so the window redraws at the
+  display's rate only while something moves and at the video's 30 fps otherwise. Inside Windows'
+  own loop for moving and sizing, a timer keeps animations going.
 - Settings live in `%APPDATA%\LensLink\settings.json` (unknown keys survive a save), the log in
   `lenslink.log` next to it. A named mutex keeps one instance; a second start shows the first window.

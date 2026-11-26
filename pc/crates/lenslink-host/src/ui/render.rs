@@ -1,65 +1,77 @@
-//! Draws the window: the video, the status pill and the caption buttons, with Direct2D on a flip-model
-//! swap chain. Glass comes in the next step; this is the plain foundation it will sit on.
+//! Draws the window on a flip-model swap chain: the glass pass (video, floating elements, curtains)
+//! with Direct3D, then the elements' labels with Direct2D and DirectWrite on top.
+
+use std::cell::RefCell;
 
 use windows::core::{w, Interface, Result};
-use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
+use windows::Win32::Foundation::{CloseHandle, D2DERR_RECREATE_TARGET, HANDLE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows_numerics::Vector2;
 
-/// Caption buttons, top right, in DIPs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Button {
-    Minimize,
-    Close,
+use super::glass::{Constants, Glass, EDGE_POINTS, MAX_ELEMENTS};
+
+/// Colour around the video when the window's shape differs from the picture's.
+const BACKGROUND: [f32; 4] = [0.035, 0.04, 0.05, 1.0];
+/// How far outside the window a closed curtain's edge rests, in DIPs: further than the drops' reach.
+const CURTAIN_REST: f32 = 24.0;
+
+pub enum Label<'a> {
+    Glyph(&'a str),
+    /// Wrapped at `wrap` DIPs.
+    Text { text: &'a str, large: bool, wrap: f32 },
 }
 
-const BUTTON: f32 = 30.0;
-const BUTTON_GAP: f32 = 8.0;
-const MARGIN: f32 = 12.0;
-
-pub fn button_rect(b: Button, width: f32) -> D2D_RECT_F {
-    let right = width - MARGIN - if b == Button::Minimize { BUTTON + BUTTON_GAP } else { 0.0 };
-    D2D_RECT_F { left: right - BUTTON, top: MARGIN, right, bottom: MARGIN + BUTTON }
+/// A floating glass element, in DIPs.
+pub struct Element<'a> {
+    pub centre: (f32, f32),
+    pub half: (f32, f32),
+    /// Glass colour: rgb and amount.
+    pub tint: [f32; 4],
+    pub label: Label<'a>,
+    pub label_alpha: f32,
 }
 
-pub fn button_at(x: f32, y: f32, width: f32) -> Option<Button> {
-    [Button::Minimize, Button::Close].into_iter().find(|&b| {
-        let r = button_rect(b, width);
-        // A little slack around each button.
-        x >= r.left - 3.0 && x <= r.right + 3.0 && y >= r.top - 3.0 && y <= r.bottom + 3.0
-    })
-}
-
-/// What to draw.
-pub struct Scene<'a> {
+pub struct Frame<'a> {
+    /// The video texture and the picture's size in it.
     pub video: Option<(&'a ID3D11Texture2D, (u32, u32))>,
-    pub status: &'a str,
-    /// Frames are arriving: the status is a statistics line, shown only on hover.
-    pub live: bool,
-    /// The pointer is over the window.
-    pub hover: bool,
-    pub hot: Option<Button>,
-    pub pressed: Option<Button>,
+    pub elements: &'a [Element<'a>],
 }
 
 pub struct Renderer {
-    swapchain: IDXGISwapChain1,
+    swapchain: IDXGISwapChain2,
+    waitable: HANDLE,
+    glass: Glass,
+    view: Option<ID3D11RenderTargetView>,
+    /// The streaming thread converts frames on the same device context.
+    lock: ID2D1Multithread,
     dc: ID2D1DeviceContext,
     target: Option<ID2D1Bitmap1>,
-    /// Direct2D view of the video texture, kept while the texture stays the same.
-    video: Option<(usize, ID2D1Bitmap1)>,
     dwrite: IDWriteFactory,
     small: IDWriteTextFormat,
     large: IDWriteTextFormat,
     glyphs: IDWriteTextFormat,
     brush: ID2D1SolidColorBrush,
     dpi: f32,
+    /// Recently used text layouts: the same labels are drawn on every frame.
+    layouts: RefCell<Vec<(LayoutKey, IDWriteTextLayout, DWRITE_TEXT_METRICS)>>,
 }
+
+#[derive(PartialEq)]
+struct LayoutKey {
+    text: String,
+    format: u8,
+    wrap: u32,
+}
+
+const LAYOUTS: usize = 16;
+const GLYPH: u8 = 2;
+
+const SWAP_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
@@ -78,13 +90,18 @@ impl Renderer {
                 Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                Flags: SWAP_FLAGS.0 as u32,
                 ..Default::default()
             };
-            let swapchain = dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None)?;
+            let swapchain: IDXGISwapChain2 = dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None)?.cast()?;
             dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
+            // One frame in flight: the window answers the pointer without lag.
+            swapchain.SetMaximumFrameLatency(1)?;
+            let waitable = swapchain.GetFrameLatencyWaitableObject();
 
             let dc = factory.CreateDevice(&dxgi)?.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             dc.SetDpi(dpi, dpi);
+            dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let format = |family, weight, size: f32| {
                 dwrite.CreateTextFormat(family, None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("ru-ru"))
@@ -97,8 +114,28 @@ impl Renderer {
             glyphs.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             glyphs.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let brush = dc.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 1.0), None)?;
-            Ok(Renderer { swapchain, dc, target: None, video: None, dwrite, small, large, glyphs, brush, dpi })
+            Ok(Renderer {
+                swapchain,
+                waitable,
+                glass: Glass::new(device)?,
+                view: None,
+                lock: factory.cast()?,
+                dc,
+                target: None,
+                dwrite,
+                small,
+                large,
+                glyphs,
+                brush,
+                dpi,
+                layouts: RefCell::default(),
+            })
         }
+    }
+
+    /// Signalled when the swap chain takes the next frame: wait for it before drawing.
+    pub fn waitable(&self) -> HANDLE {
+        self.waitable
     }
 
     pub fn set_dpi(&mut self, dpi: f32) {
@@ -107,26 +144,73 @@ impl Renderer {
         unsafe { self.dc.SetDpi(dpi, dpi) };
     }
 
-    /// The window changed size: the swap chain follows on the next draw.
+    /// The window changed size: the swap chain follows.
     pub fn resize(&mut self) -> Result<()> {
         unsafe {
             self.target = None;
+            self.view = None;
             self.dc.SetTarget(None::<&ID2D1Image>);
-            self.swapchain.ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))
+            self.swapchain.ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, SWAP_FLAGS)
         }
+    }
+
+    pub fn pixels(&self) -> (u32, u32) {
+        let desc = unsafe { self.swapchain.GetDesc1() }.unwrap_or_default();
+        (desc.Width, desc.Height)
     }
 
     /// Window size in DIPs.
     pub fn size(&self) -> (f32, f32) {
-        let desc = unsafe { self.swapchain.GetDesc1() }.unwrap_or_default();
-        (desc.Width as f32 * 96.0 / self.dpi, desc.Height as f32 * 96.0 / self.dpi)
+        let (w, h) = self.pixels();
+        (w as f32 * 96.0 / self.dpi, h as f32 * 96.0 / self.dpi)
     }
 
-    pub fn draw(&mut self, scene: &Scene) -> Result<()> {
+    /// Size of `text` as a label wrapped at `wrap`, in DIPs.
+    pub fn measure(&self, text: &str, large: bool, wrap: f32) -> (f32, f32) {
+        self.layout(text, large as u8, wrap).map_or((0.0, 0.0), |(_, m)| (m.width, m.height))
+    }
+
+    /// A centred layout of `text` in a box `wrap` wide, and its metrics.
+    fn layout(&self, text: &str, format: u8, wrap: f32) -> Option<(IDWriteTextLayout, DWRITE_TEXT_METRICS)> {
+        let key = LayoutKey { text: text.to_string(), format, wrap: (wrap.max(1.0) * 4.0) as u32 };
+        let mut cache = self.layouts.borrow_mut();
+        if let Some(i) = cache.iter().position(|(k, ..)| *k == key) {
+            let entry = cache.remove(i);
+            let found = (entry.1.clone(), entry.2);
+            cache.push(entry);
+            return Some(found);
+        }
+        let f = match format {
+            GLYPH => &self.glyphs,
+            1 => &self.large,
+            _ => &self.small,
+        };
+        let utf16: Vec<u16> = text.encode_utf16().collect();
         unsafe {
-            let desc = self.swapchain.GetDesc1()?;
-            if desc.Width == 0 || desc.Height == 0 {
+            let layout = self.dwrite.CreateTextLayout(&utf16, f, key.wrap as f32 / 4.0, 1000.0).ok()?;
+            layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER).ok()?;
+            layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR).ok()?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m).ok()?;
+            if cache.len() >= LAYOUTS {
+                cache.remove(0);
+            }
+            cache.push((key, layout.clone(), m));
+            Some((layout, m))
+        }
+    }
+
+    pub fn draw(&mut self, frame: &Frame) -> Result<()> {
+        unsafe {
+            let (pw, ph) = self.pixels();
+            if pw == 0 || ph == 0 {
                 return Ok(());
+            }
+            if self.view.is_none() {
+                let buffer: ID3D11Texture2D = self.swapchain.GetBuffer(0)?;
+                let mut view = None;
+                buffer.GetDevice()?.CreateRenderTargetView(&buffer, None, Some(&mut view))?;
+                self.view = view;
             }
             if self.target.is_none() {
                 let surface: IDXGISurface = self.swapchain.GetBuffer(0)?;
@@ -141,101 +225,97 @@ impl Renderer {
                 self.dc.SetTarget(&target);
                 self.target = Some(target);
             }
-            let (w, h) = self.size();
-            let dc = self.dc.clone();
-            dc.BeginDraw();
-            dc.Clear(Some(&color(0.035, 0.04, 0.05, 1.0)));
 
-            if let Some((texture, size)) = scene.video {
-                let bitmap = self.video_bitmap(texture)?;
-                let dest = letterbox(size, (w, h));
-                dc.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
+            let px = self.dpi / 96.0;
+            let mut c = Constants { size: [pw as f32, ph as f32], px, background: BACKGROUND, ..Default::default() };
+            // Closed curtains rest just outside the window, out of reach of the elements near its edges.
+            let rest = -CURTAIN_REST * px;
+            c.edges = [[rest; 4]; EDGE_POINTS];
+            c.edge_max = [rest; 4];
+            if let Some((_, picture)) = frame.video {
+                c.video = letterbox(picture, (pw, ph));
+            }
+            for (i, e) in frame.elements.iter().take(MAX_ELEMENTS).enumerate() {
+                let (hw, hh) = (e.half.0 * px, e.half.1 * px);
+                let r = hw.min(hh);
+                c.boxes[i] = [e.centre.0 * px, e.centre.1 * px, hw, hh];
+                c.corners[i] = [r, r, 0.0, 0.0];
+                c.tints[i] = e.tint;
+                c.count = (i + 1) as f32;
             }
 
-            if !scene.live && !scene.status.is_empty() {
-                // Nothing to watch: the status, large, in the middle.
-                self.pill(scene.status, &self.large.clone(), (w / 2.0, h / 2.0), w - 64.0, true)?;
-            } else if scene.hover && !scene.status.is_empty() {
-                self.pill(scene.status, &self.small.clone(), (MARGIN, h - MARGIN), w - 2.0 * MARGIN, false)?;
-            }
-
-            if scene.hover {
-                for (b, glyph) in [(Button::Minimize, "\u{E921}"), (Button::Close, "\u{E8BB}")] {
-                    let r = button_rect(b, w);
-                    let hot = scene.hot == Some(b);
-                    let fill = match (b, hot, scene.pressed == Some(b)) {
-                        (Button::Close, true, _) => color(0.86, 0.22, 0.2, 0.92),
-                        (_, true, true) => color(1.0, 1.0, 1.0, 0.32),
-                        (_, true, false) => color(1.0, 1.0, 1.0, 0.22),
-                        _ => color(0.06, 0.07, 0.08, 0.55),
-                    };
-                    self.brush.SetColor(&fill);
-                    dc.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: BUTTON / 2.0, radiusY: BUTTON / 2.0 }, &self.brush);
-                    self.brush.SetColor(&color(1.0, 1.0, 1.0, 0.95));
-                    let text: Vec<u16> = glyph.encode_utf16().collect();
-                    dc.DrawText(&text, &self.glyphs, &r, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
-                }
-            }
-
-            let result = dc.EndDraw(None, None);
+            self.lock.Enter();
+            let result = self.draw_locked(frame, &c);
+            self.lock.Leave();
             if let Err(e) = &result {
                 if e.code() == D2DERR_RECREATE_TARGET {
                     self.target = None;
-                    self.video = None;
+                    self.view = None;
                 }
             }
             result?;
-            self.swapchain.Present(0, DXGI_PRESENT(0)).ok()
+            self.swapchain.Present(1, DXGI_PRESENT(0)).ok()
         }
     }
 
-    /// A dark pill with `text`; `at` is its centre when `centred`, else its lower left corner.
-    unsafe fn pill(&self, text: &str, format: &IDWriteTextFormat, at: (f32, f32), max_width: f32, centred: bool) -> Result<()> {
+    unsafe fn draw_locked(&mut self, frame: &Frame, c: &Constants) -> Result<()> {
         unsafe {
-            let text: Vec<u16> = text.encode_utf16().collect();
-            let layout = self.dwrite.CreateTextLayout(&text, format, max_width.max(40.0) - 28.0, 400.0)?;
-            let mut m = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut m)?;
-            let (pw, ph) = (m.width + 28.0, m.height + 14.0);
-            let (x, y) = if centred { (at.0 - pw / 2.0, at.1 - ph / 2.0) } else { (at.0, at.1 - ph) };
-            let rect = D2D_RECT_F { left: x, top: y, right: x + pw, bottom: y + ph };
-            let radius = (ph / 2.0).min(18.0);
-            self.brush.SetColor(&color(0.05, 0.06, 0.07, 0.72));
-            self.dc.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect, radiusX: radius, radiusY: radius }, &self.brush);
-            self.brush.SetColor(&color(0.96, 0.97, 0.98, 1.0));
-            // The layout is as wide as the longest line; centred text is placed by its own left edge.
-            self.dc.DrawTextLayout(Vector2 { X: x + 14.0 - m.left, Y: y + 7.0 }, &layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-            Ok(())
-        }
-    }
+            let view = self.view.clone().unwrap();
+            self.glass.draw(&view, frame.video.map(|v| v.0), c)?;
 
-    unsafe fn video_bitmap(&mut self, texture: &ID3D11Texture2D) -> Result<ID2D1Bitmap1> {
-        unsafe {
-            let key = texture.as_raw() as usize;
-            if let Some((k, b)) = &self.video {
-                if *k == key {
-                    return Ok(b.clone());
+            let dc = self.dc.clone();
+            dc.BeginDraw();
+            for e in frame.elements.iter().take(MAX_ELEMENTS) {
+                if e.label_alpha <= 0.01 {
+                    continue;
                 }
+                let (text, format, wrap) = match e.label {
+                    Label::Glyph(g) => (g, GLYPH, 100.0),
+                    Label::Text { text, large, wrap } => (text, large as u8, wrap),
+                };
+                let Some((layout, m)) = self.layout(text, format, wrap) else { continue };
+                // The layout is centred in its box: place the text's own middle on the element's.
+                let origin = |dy: f32| Vector2 {
+                    X: e.centre.0 - m.width / 2.0 - m.left,
+                    Y: e.centre.1 - m.height / 2.0 - m.top + dy,
+                };
+                // A faint shadow keeps the light text readable over a light picture.
+                self.brush.SetColor(&color(0.0, 0.0, 0.0, 0.4 * e.label_alpha));
+                dc.DrawTextLayout(origin(1.0), &layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                self.brush.SetColor(&color(0.96, 0.97, 0.98, e.label_alpha));
+                dc.DrawTextLayout(origin(0.0), &layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
             }
-            let surface: IDXGISurface = texture.cast()?;
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                ..Default::default()
-            };
-            let bitmap = self.dc.CreateBitmapFromDxgiSurface(&surface, Some(&props))?;
-            self.video = Some((key, bitmap.clone()));
-            Ok(bitmap)
+            dc.EndDraw(None, None)
         }
     }
 }
 
-/// Largest rectangle with the picture's aspect ratio, centred in `window` (DIPs).
-fn letterbox(picture: (u32, u32), window: (f32, f32)) -> D2D_RECT_F {
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.waitable);
+        }
+    }
+}
+
+/// Largest rectangle with the picture's aspect ratio, centred in `window`, in whole pixels:
+/// x, y, w, h.
+pub fn letterbox(picture: (u32, u32), window: (u32, u32)) -> [f32; 4] {
     let (pw, ph) = (picture.0.max(1) as f32, picture.1.max(1) as f32);
-    let scale = (window.0 / pw).min(window.1 / ph);
-    let (w, h) = (pw * scale, ph * scale);
-    let (x, y) = ((window.0 - w) / 2.0, (window.1 - h) / 2.0);
-    D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h }
+    let scale = (window.0 as f32 / pw).min(window.1 as f32 / ph);
+    let (w, h) = ((pw * scale).round(), (ph * scale).round());
+    let (x, y) = (((window.0 as f32 - w) / 2.0).floor(), ((window.1 as f32 - h) / 2.0).floor());
+    [x, y, w, h]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::letterbox;
+
+    #[test]
+    fn letterbox_fills_one_side_in_whole_pixels() {
+        assert_eq!(letterbox((1920, 1080), (1280, 720)), [0.0, 0.0, 1280.0, 720.0]);
+        assert_eq!(letterbox((1920, 1080), (1000, 1000)), [0.0, 218.0, 1000.0, 563.0]);
+        assert_eq!(letterbox((1080, 1920), (1600, 900)), [547.0, 0.0, 506.0, 900.0]);
+    }
 }

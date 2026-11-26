@@ -2,10 +2,13 @@
 //!
 //! The streaming side (phone connection, decoder, virtual camera) runs on the thread that created the
 //! [`Link`]. The window has a thread of its own so that it stays smooth whatever the connection does.
-//! Frames never leave the GPU: the streaming side converts each decoded frame into an RGB texture on the
-//! shared D3D11 device and posts a message, and the window draws that texture with Direct2D.
+//! Frames never leave the GPU: the streaming side converts each decoded frame into an RGB texture of the
+//! size the video takes in the window, on the shared D3D11 device, and posts a message; the window
+//! draws it through its glass shader.
 
+mod glass;
 mod icon;
+mod overlay;
 mod render;
 mod window;
 
@@ -53,9 +56,12 @@ pub(crate) struct Shared {
 #[derive(Default)]
 pub(crate) struct State {
     pub status: String,
-    /// The latest frame as RGB, `size` pixels.
+    /// The latest frame as RGB, scaled for the window.
     pub video: Option<Com<ID3D11Texture2D>>,
+    /// The picture's size from the phone.
     pub size: (u32, u32),
+    /// The size in pixels the video takes in the window now: frames are scaled to it.
+    pub want: (u32, u32),
     pub last_frame: Option<Instant>,
 }
 
@@ -143,15 +149,16 @@ impl Link {
         if !self.visible() {
             return Ok(());
         }
+        let want = self.shared.state().want;
         let texture = unsafe {
             self.d2d_lock.Enter();
-            let r = self.converter.convert(frame, self.picture);
+            let r = self.converter.convert(frame, self.picture, want);
             self.d2d_lock.Leave();
             r?
         };
         {
             let mut st = self.shared.state();
-            st.size = self.converter.output_size();
+            st.size = self.converter.picture();
             st.video = Some(Com(texture));
             st.last_frame = Some(Instant::now());
         }
@@ -171,7 +178,8 @@ impl Drop for Link {
     }
 }
 
-/// NV12 decoder output to a BGRA texture of the visible picture, on the GPU's video processor.
+/// NV12 decoder output to a BGRA texture of the visible picture, scaled to the window, on the GPU's
+/// video processor (the same scaler video players use).
 struct Converter {
     device: ID3D11Device,
     video_device: ID3D11VideoDevice,
@@ -181,6 +189,7 @@ struct Converter {
 
 struct Gpu {
     input: (u32, u32),
+    picture: (u32, u32),
     output: (u32, u32),
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
@@ -200,20 +209,23 @@ impl Converter {
         })
     }
 
-    fn output_size(&self) -> (u32, u32) {
-        self.gpu.as_ref().map_or((0, 0), |g| g.output)
+    /// The picture's size, without the decoder's padding.
+    fn picture(&self) -> (u32, u32) {
+        self.gpu.as_ref().map_or((0, 0), |g| g.picture)
     }
 
-    unsafe fn convert(&mut self, frame: &Frame, picture: (u32, u32)) -> windows::core::Result<ID3D11Texture2D> {
+    /// `want`: the size to scale to; (0, 0) keeps the picture's own.
+    unsafe fn convert(&mut self, frame: &Frame, picture: (u32, u32), want: (u32, u32)) -> windows::core::Result<ID3D11Texture2D> {
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             frame.texture.GetDesc(&mut desc);
             let input = (desc.Width, desc.Height);
             // Decoder textures are padded (1080 → 1088): only the picture is shown.
-            let output = (picture.0.min(input.0), picture.1.min(input.1));
-            if self.gpu.as_ref().is_none_or(|g| g.input != input || g.output != output) {
+            let picture = (picture.0.min(input.0), picture.1.min(input.1));
+            let output = if want.0 > 0 && want.1 > 0 { (want.0.min(8192), want.1.min(8192)) } else { picture };
+            if self.gpu.as_ref().is_none_or(|g| g.input != input || g.picture != picture || g.output != output) {
                 self.gpu = None;
-                self.gpu = Some(self.create(input, output)?);
+                self.gpu = Some(self.create(input, picture, output)?);
             }
             let g = self.gpu.as_ref().unwrap();
 
@@ -227,11 +239,12 @@ impl Converter {
             let mut in_view = None;
             self.video_device
                 .CreateVideoProcessorInputView(&frame.texture, &g.enumerator, &in_desc, Some(&mut in_view))?;
-            let rect = RECT { left: 0, top: 0, right: output.0 as i32, bottom: output.1 as i32 };
+            let source = RECT { left: 0, top: 0, right: picture.0 as i32, bottom: picture.1 as i32 };
+            let dest = RECT { left: 0, top: 0, right: output.0 as i32, bottom: output.1 as i32 };
             let vc = &self.video_context;
-            vc.VideoProcessorSetStreamSourceRect(&g.processor, 0, true, Some(&rect));
-            vc.VideoProcessorSetStreamDestRect(&g.processor, 0, true, Some(&rect));
-            vc.VideoProcessorSetOutputTargetRect(&g.processor, true, Some(&rect));
+            vc.VideoProcessorSetStreamSourceRect(&g.processor, 0, true, Some(&source));
+            vc.VideoProcessorSetStreamDestRect(&g.processor, 0, true, Some(&dest));
+            vc.VideoProcessorSetOutputTargetRect(&g.processor, true, Some(&dest));
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
                 pInputSurface: std::mem::ManuallyDrop::new(in_view),
@@ -246,7 +259,7 @@ impl Converter {
         }
     }
 
-    unsafe fn create(&self, input: (u32, u32), output: (u32, u32)) -> windows::core::Result<Gpu> {
+    unsafe fn create(&self, input: (u32, u32), picture: (u32, u32), output: (u32, u32)) -> windows::core::Result<Gpu> {
         unsafe {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: output.0,
@@ -288,7 +301,7 @@ impl Converter {
             };
             let mut view = None;
             self.video_device.CreateVideoProcessorOutputView(&target, &enumerator, &view_desc, Some(&mut view))?;
-            Ok(Gpu { input, output, enumerator, processor, target, view: view.unwrap() })
+            Ok(Gpu { input, picture, output, enumerator, processor, target, view: view.unwrap() })
         }
     }
 }
