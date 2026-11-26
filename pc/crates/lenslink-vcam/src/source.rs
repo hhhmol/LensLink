@@ -1,4 +1,4 @@
-//! The media source: one live NV12 video stream.
+//! The media source: one live NV12 video stream offering every mode the phone supports.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -11,7 +11,7 @@ use windows_core::{implement, ComObject, Interface, IUnknown, Ref, Result, BOOL,
 
 use crate::attrs::{forward_attributes, raw};
 use crate::log::vlog;
-use crate::shm::{FPS, FRAME_BYTES, HEIGHT, WIDTH};
+use crate::modes::{self, Mode};
 use crate::stream::{forward_events, no_ks_properties, Stream};
 
 #[implement(IMFMediaSourceEx, IMFGetService, IKsControl, IMFAttributes)]
@@ -27,9 +27,12 @@ impl Source {
     pub fn create() -> Result<IMFMediaSourceEx> {
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)?;
-            let media_type = media_type()?;
-            let sd = MFCreateStreamDescriptor(0, &[Some(media_type.clone())])?;
-            sd.GetMediaTypeHandler()?.SetCurrentMediaType(&media_type)?;
+            let modes = modes::read();
+            vlog!("modes: {}", modes.iter().map(Mode::to_string).collect::<Vec<_>>().join(" "));
+            let types = modes.iter().map(|&m| media_type(m).map(Some)).collect::<Result<Vec<_>>>()?;
+            let sd = MFCreateStreamDescriptor(0, &types)?;
+            // The first mode in the file is the default.
+            sd.GetMediaTypeHandler()?.SetCurrentMediaType(types[0].as_ref().unwrap())?;
             sd.SetGUID(&MF_DEVICESTREAM_STREAM_CATEGORY, &PINNAME_VIDEO_CAPTURE)?;
             sd.SetUINT32(&MF_DEVICESTREAM_STREAM_ID, 0)?;
             sd.SetUINT32(&MF_DEVICESTREAM_FRAMESERVER_SHARED, 1)?;
@@ -47,7 +50,7 @@ impl Source {
                 stream: Mutex::new(None),
                 announced: AtomicBool::new(false),
             });
-            let stream = ComObject::new(Stream::new(sd, stream_attrs)?);
+            let stream = ComObject::new(Stream::new(sd, stream_attrs, modes[0])?);
             let ex: IMFMediaSourceEx = source.to_interface();
             stream.set_source(ex.cast()?);
             *source.stream.lock().unwrap() = Some(stream);
@@ -67,20 +70,36 @@ fn new_attributes() -> Result<IMFAttributes> {
     Ok(a.expect("MFCreateAttributes returned no store"))
 }
 
-fn media_type() -> Result<IMFMediaType> {
+fn media_type(m: Mode) -> Result<IMFMediaType> {
     unsafe {
         let t = MFCreateMediaType()?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
-        t.SetUINT64(&MF_MT_FRAME_SIZE, ((WIDTH as u64) << 32) | HEIGHT as u64)?;
-        t.SetUINT64(&MF_MT_FRAME_RATE, ((FPS as u64) << 32) | 1)?;
+        t.SetUINT64(&MF_MT_FRAME_SIZE, ((m.width as u64) << 32) | m.height as u64)?;
+        t.SetUINT64(&MF_MT_FRAME_RATE, ((m.fps as u64) << 32) | 1)?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1 << 32) | 1)?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         t.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-        t.SetUINT32(&MF_MT_DEFAULT_STRIDE, WIDTH)?;
-        t.SetUINT32(&MF_MT_SAMPLE_SIZE, FRAME_BYTES as u32)?;
-        t.SetUINT32(&MF_MT_AVG_BITRATE, WIDTH * HEIGHT * 12 * FPS)?;
+        t.SetUINT32(&MF_MT_DEFAULT_STRIDE, m.width)?;
+        t.SetUINT32(&MF_MT_SAMPLE_SIZE, m.frame_bytes() as u32)?;
+        t.SetUINT32(&MF_MT_AVG_BITRATE, (m.frame_bytes() as u64 * 8 * m.fps as u64).min(u32::MAX as u64) as u32)?;
         Ok(t)
+    }
+}
+
+/// The mode of the media type the app set on the stream.
+fn current_mode(sd: &IMFStreamDescriptor) -> Result<Mode> {
+    unsafe {
+        let t = sd.GetMediaTypeHandler()?.GetCurrentMediaType()?;
+        let size = t.GetUINT64(&MF_MT_FRAME_SIZE)?;
+        let rate = t.GetUINT64(&MF_MT_FRAME_RATE)?;
+        let den = (rate & 0xffff_ffff).max(1);
+        let m = Mode { width: (size >> 32) as u32, height: size as u32, fps: ((rate >> 32) / den) as u32 };
+        if m.is_valid() {
+            Ok(m)
+        } else {
+            Err(MF_E_INVALIDMEDIATYPE.into())
+        }
     }
 }
 
@@ -105,6 +124,9 @@ impl IMFMediaSource_Impl for Source_Impl {
             let mut sd = None;
             pd.GetStreamDescriptorByIndex(0, &mut selected, &mut sd)?;
             if selected.as_bool() {
+                if let Some(sd) = &sd {
+                    stream.set_mode(current_mode(sd)?);
+                }
                 let event = if self.announced.swap(true, Ordering::AcqRel) { MEUpdatedStream } else { MENewStream };
                 let unknown: IUnknown = stream.to_interface();
                 self.queue.QueueEventParamUnk(event.0 as u32, &GUID::zeroed(), S_OK, &unknown)?;

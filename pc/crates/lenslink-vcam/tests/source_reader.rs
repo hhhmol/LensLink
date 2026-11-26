@@ -1,9 +1,10 @@
 //! Reads frames from the media source in-process, the way an app would through the Frame Server.
 //! Without a service account the shared memory cannot be created, so this sees placeholder frames.
+//! Expects no modes file, or one whose first mode is 1080p30 (the default).
 
 use std::time::Instant;
 
-use lenslink_vcam::shm::{FRAME_BYTES, HEIGHT, WIDTH};
+use lenslink_vcam::modes::Mode;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
@@ -18,7 +19,7 @@ fn delivers_frames() {
 
         let t = reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32).unwrap();
         assert_eq!(t.GetGUID(&MF_MT_SUBTYPE).unwrap(), MFVideoFormat_NV12);
-        assert_eq!(t.GetUINT64(&MF_MT_FRAME_SIZE).unwrap(), ((WIDTH as u64) << 32) | HEIGHT as u64);
+        assert_eq!(t.GetUINT64(&MF_MT_FRAME_SIZE).unwrap(), ((Mode::DEFAULT.width as u64) << 32) | Mode::DEFAULT.height as u64);
 
         let start = Instant::now();
         let mut got = 0;
@@ -36,7 +37,7 @@ fn delivers_frames() {
                 )
                 .unwrap();
             if let Some(s) = sample {
-                assert_eq!(s.GetTotalLength().unwrap() as usize, FRAME_BYTES);
+                assert_eq!(s.GetTotalLength().unwrap() as usize, Mode::DEFAULT.frame_bytes());
                 got += 1;
             }
         }

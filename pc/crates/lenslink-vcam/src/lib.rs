@@ -10,6 +10,7 @@
 
 #![allow(non_snake_case)] // COM method names
 
+pub mod modes;
 pub mod shm;
 
 mod activator;

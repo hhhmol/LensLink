@@ -23,8 +23,9 @@ Pre-alpha, step 4 of the [roadmap](docs/architecture.md#roadmap) done. Working n
 - a **camera probe** that reports what Camera2 and the hardware encoders of a phone can really do;
 - **streaming** the phone camera over USB into a LensLink window on the PC, decoded on the GPU
   (≈ 200 ms glass-to-glass at 1080p30 on a Redmi Note 8T);
-- a **Windows 11 virtual camera** "LensLink" that any app can pick (Camera, Teams, Zoom, browsers),
-  1080p30 NV12.
+- a **Windows 11 virtual camera** "LensLink" that any app can pick (Camera, Teams, Zoom, browsers).
+  It offers every webcam mode the phone camera supports (e.g. 4K30, 1080p60, 720p30); picking one in
+  an app switches the phone to it.
 
 Not yet: camera controls from the PC, filters, a tray app, an installer.
 
@@ -98,8 +99,12 @@ cargo run --release -p lenslink-host -- stream --vcam --no-play  # camera only
 ```
 
 The camera "LensLink" appears in apps while `lenslink-host` runs and disappears when it exits.
-Without a phone stream it shows dark grey. `cargo run --release -p lenslink-vcam --example grab`
-opens the camera like an app and reports the frame rate it receives.
+On start the host asks the phone for its capabilities and offers apps the modes that the camera,
+its auto-exposure and the hardware encoder all support, from 4K down to 640x360 at 30 or 60 fps.
+When an app selects a mode, the phone switches to it (about half a second of grey); bitrate follows
+the mode unless `--bitrate` is given. `--size`/`--fps` pick the default mode.
+Without a phone stream it shows dark grey. `cargo run --release -p lenslink-vcam --example grab -- 90 out.pgm 3840x2160@30`
+opens the camera like an app, lists its modes, selects one and reports the frame rate it receives.
 
 ## License
 

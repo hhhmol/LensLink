@@ -11,7 +11,9 @@ use lenslink_protocol::{self as proto, flags, Kind, ProtocolError};
 use serde_json::{json, Value};
 
 use crate::adb;
+use crate::modes;
 use crate::video::{self, Viewer};
+use lenslink_vcam::modes::Mode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -55,7 +57,8 @@ pub struct Options {
     pub height: u32,
     pub fps: u32,
     pub codec: Codec,
-    pub bitrate: u32,
+    /// `None`: chosen per mode.
+    pub bitrate: Option<u32>,
     pub zoom: Option<f32>,
     pub stabilization: bool,
     pub player: Player,
@@ -73,7 +76,7 @@ impl Default for Options {
             height: 1080,
             fps: 30,
             codec: Codec::H264,
-            bitrate: 20_000_000,
+            bitrate: None,
             zoom: None,
             stabilization: true,
             player: Player::Window,
@@ -90,7 +93,7 @@ stream options:
   --size <WxH>           e.g. 1920x1080 (default), 3840x2160
   --fps <n>              frames per second (default 30)
   --codec <h264|h265>    default h264
-  --bitrate <n[k|M]>     e.g. 20M (default)
+  --bitrate <n[k|M]>     e.g. 20M (default: by mode, 20M at 1080p30)
   --zoom <ratio>         logical-camera zoom, e.g. 0.6 for ultrawide
   --no-stabilization     disable EIS/OIS
   --out <file>           also save the raw stream (.h264 / .h265)
@@ -126,7 +129,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                     other => return Err(format!("unknown codec {other}")),
                 }
             }
-            "--bitrate" => o.bitrate = parse_bitrate(&value(arg)?)?,
+            "--bitrate" => o.bitrate = Some(parse_bitrate(&value(arg)?)?),
             "--zoom" => o.zoom = Some(value(arg)?.parse().map_err(|_| "bad --zoom".to_string())?),
             "--no-stabilization" => o.stabilization = false,
             "--out" => o.out = Some(PathBuf::from(value(arg)?)),
@@ -180,29 +183,29 @@ fn stream(o: &Options) -> Result<(), String> {
         Err(e) => return Err(e.to_string()),
     }
 
-    let mut start = json!({
-        "type": "start",
-        "camera_id": o.camera,
-        "width": o.width,
-        "height": o.height,
-        "fps": o.fps,
-        "codec": o.codec.wire_name(),
-        "bitrate": o.bitrate,
-        "stabilization": o.stabilization,
-    });
-    if let Some(z) = o.zoom {
-        start["zoom"] = json!(z);
+    let mut mode = Mode { width: o.width, height: o.height, fps: o.fps };
+    if o.virtual_camera {
+        // The camera offers apps the modes this phone camera supports.
+        send_control(&mut writer, &json!({ "type": "get_capabilities" }))?;
+        let caps = wait_for_capabilities(&mut reader)?;
+        let offered = modes::from_capabilities(&caps, &o.camera, o.codec)?;
+        if !offered.contains(&mode) {
+            let fallback = if offered.contains(&Mode::DEFAULT) { Mode::DEFAULT } else { offered[0] };
+            eprintln!("camera {} has no {mode} mode; starting with {fallback}", o.camera);
+            mode = fallback;
+        }
+        // The first line is the camera's default mode.
+        let mut list = vec![mode];
+        list.extend(offered.iter().copied().filter(|m| *m != mode));
+        lenslink_vcam::modes::write(&list).map_err(|e| {
+            format!(
+                "cannot write {} ({e}). Reinstall the virtual camera: tools/install-vcam.ps1",
+                lenslink_vcam::modes::MODES_PATH
+            )
+        })?;
+        eprintln!("camera modes: {}", list.iter().map(Mode::to_string).collect::<Vec<_>>().join(", "));
     }
-    send_control(&mut writer, &start)?;
-    eprintln!(
-        "requested camera {} {}x{}@{} {} {:.1} Mbit/s",
-        o.camera,
-        o.width,
-        o.height,
-        o.fps,
-        o.codec.wire_name(),
-        o.bitrate as f64 / 1e6
-    );
+    send_control(&mut writer, &start_message(o, mode))?;
 
     let mut file = match &o.out {
         Some(path) => Some(
@@ -210,12 +213,12 @@ fn stream(o: &Options) -> Result<(), String> {
         ),
         None => None,
     };
-    let title = format!("LensLink {}x{}@{} {}", o.width, o.height, o.fps, o.codec.wire_name());
+    let title = format!("LensLink {mode} {}", o.codec.wire_name());
     let mut ffplay = if o.player == Player::Ffplay { Some(spawn_ffplay(o, &title)?) } else { None };
     let mut viewer = if o.player == Player::Window || o.virtual_camera {
         video::init()?;
         let outputs = video::Outputs { window: o.player == Player::Window, virtual_camera: o.virtual_camera };
-        Some(Viewer::new(o.codec, o.width, o.height, o.fps, &title, outputs)?)
+        Some(Viewer::new(o.codec, mode, outputs)?)
     } else {
         None
     };
@@ -238,6 +241,13 @@ fn stream(o: &Options) -> Result<(), String> {
 window closed");
                     return Ok(());
                 }
+                if let Some(requested) = v.take_request().filter(|r| *r != mode) {
+                    eprintln!("
+an app selected {requested}: switching the phone");
+                    mode = requested;
+                    send_control(&mut writer, &start_message(o, mode))?;
+                    v.set_mode(mode).map_err(|e| format!("switching to {mode}: {e}"))?;
+                }
             }
             let packet = match rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(Ok(Some(p))) => p,
@@ -249,20 +259,7 @@ window closed");
             };
             match packet.header.kind {
                 Kind::Control => {
-                    let text = String::from_utf8_lossy(&packet.payload);
-                    let msg: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                    match msg["type"].as_str() {
-                        Some("error") => {
-                            return Err(format!("phone: {}", msg["message"].as_str().unwrap_or("unknown error")))
-                        }
-                        Some("device_info") => eprintln!(
-                            "phone: {} {}, Android {}",
-                            msg["manufacturer"].as_str().unwrap_or("?"),
-                            msg["model"].as_str().unwrap_or("?"),
-                            msg["android"].as_str().unwrap_or("?")
-                        ),
-                        _ => eprintln!("phone: {text}"),
-                    }
+                    control_message(&packet.payload)?;
                 }
                 Kind::Video => {
                     let h = &packet.header;
@@ -293,6 +290,65 @@ player window closed");
     // Unblocks the reader thread.
     let _ = writer.shutdown(std::net::Shutdown::Both);
     result
+}
+
+fn start_message(o: &Options, mode: Mode) -> Value {
+    let bitrate = o.bitrate.unwrap_or_else(|| modes::bitrate(mode));
+    let mut start = json!({
+        "type": "start",
+        "camera_id": o.camera,
+        "width": mode.width,
+        "height": mode.height,
+        "fps": mode.fps,
+        "codec": o.codec.wire_name(),
+        "bitrate": bitrate,
+        "stabilization": o.stabilization,
+    });
+    if let Some(z) = o.zoom {
+        start["zoom"] = json!(z);
+    }
+    eprintln!(
+        "requested camera {} {mode} {} {:.1} Mbit/s",
+        o.camera,
+        o.codec.wire_name(),
+        bitrate as f64 / 1e6
+    );
+    start
+}
+
+/// Prints a control message from the phone; returns it parsed. A phone error ends the session.
+fn control_message(payload: &[u8]) -> Result<Value, String> {
+    let text = String::from_utf8_lossy(payload);
+    let msg: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    match msg["type"].as_str() {
+        Some("error") => return Err(format!("phone: {}", msg["message"].as_str().unwrap_or("unknown error"))),
+        Some("device_info") => eprintln!(
+            "phone: {} {}, Android {}",
+            msg["manufacturer"].as_str().unwrap_or("?"),
+            msg["model"].as_str().unwrap_or("?"),
+            msg["android"].as_str().unwrap_or("?")
+        ),
+        Some("capabilities") => {}
+        _ => eprintln!("phone: {text}"),
+    }
+    Ok(msg)
+}
+
+/// Reads until the phone answers `get_capabilities` (nothing is streaming yet).
+fn wait_for_capabilities(reader: &mut impl io::Read) -> Result<Value, String> {
+    loop {
+        match proto::read_packet(reader) {
+            Ok(Some(p)) if p.header.kind == Kind::Control => {
+                let msg = control_message(&p.payload)?;
+                if msg["type"] == "capabilities" {
+                    return Ok(msg);
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return Err("the phone closed the connection".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 fn send_control(w: &mut impl Write, msg: &Value) -> Result<(), String> {
@@ -422,7 +478,7 @@ mod tests {
         assert_eq!(o.serial.as_deref(), Some("abc"));
         assert_eq!((o.width, o.height, o.fps), (3840, 2160, 60));
         assert_eq!(o.codec, Codec::H265);
-        assert_eq!(o.bitrate, 45_000_000);
+        assert_eq!(o.bitrate, Some(45_000_000));
         assert_eq!(o.zoom, Some(0.6));
         assert!(!o.stabilization);
     }

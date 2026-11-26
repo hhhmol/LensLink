@@ -13,6 +13,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 pub use crate::stream::Codec;
 use decoder::Decoder;
+use lenslink_vcam::modes::Mode;
 use preview::Preview;
 use vcam::VirtualCamera;
 
@@ -48,10 +49,12 @@ pub fn create_device() -> windows::core::Result<ID3D11Device> {
 
 /// Decoder plus its outputs (window and/or virtual camera), driven from the thread that created it.
 pub struct Viewer {
+    device: ID3D11Device,
+    codec: Codec,
+    mode: Mode,
     decoder: Decoder,
     preview: Option<Preview>,
     camera: Option<VirtualCamera>,
-    title: String,
 }
 
 pub struct Outputs {
@@ -60,35 +63,58 @@ pub struct Outputs {
 }
 
 impl Viewer {
-    pub fn new(codec: Codec, width: u32, height: u32, fps: u32, title: &str, outputs: Outputs) -> Result<Self, String> {
+    pub fn new(codec: Codec, mode: Mode, outputs: Outputs) -> Result<Self, String> {
         if !decoder::available(codec) {
             return Err(match codec {
-                Codec::H265 => "Windows has no H.265 decoder. Install \"HEVC Video Extensions\" from the                                 Microsoft Store, or use --codec h264"
+                Codec::H265 => "Windows has no H.265 decoder. Install \"HEVC Video Extensions\" from the \
+                                Microsoft Store, or use --codec h264"
                     .into(),
                 Codec::H264 => "Windows has no hardware H.264 decoder; use --ffplay".into(),
             });
         }
         let device = create_device().map_err(|e| format!("Direct3D 11: {e}"))?;
-        let decoder =
-            Decoder::new(&device, codec, width, height, fps).map_err(|e| format!("decoder: {e}"))?;
+        let decoder = Decoder::new(&device, codec, mode.width, mode.height, mode.fps)
+            .map_err(|e| format!("decoder: {e}"))?;
+        let picture = (mode.width, mode.height);
         let camera = if outputs.virtual_camera {
-            let c = VirtualCamera::new(&device, (width, height))?;
+            let c = VirtualCamera::new(&device, picture, mode)?;
             eprintln!("virtual camera \"{}\" is available to apps", lenslink_vcam::FRIENDLY_NAME);
             Some(c)
         } else {
             None
         };
         let preview = if outputs.window {
-            Some(Preview::new(&device, title, (width, height)).map_err(|e| format!("window: {e}"))?)
+            Some(Preview::new(&device, &title(codec, mode), picture).map_err(|e| format!("window: {e}"))?)
         } else {
             None
         };
-        Ok(Viewer { decoder, preview, camera, title: title.to_string() })
+        Ok(Viewer { device, codec, mode, decoder, preview, camera })
     }
 
     /// Returns false once the user closed the window.
     pub fn pump(&mut self) -> bool {
         self.preview.as_mut().is_none_or(Preview::pump)
+    }
+
+    /// A mode an app selected on the virtual camera, once per change.
+    pub fn take_request(&mut self) -> Option<Mode> {
+        self.camera.as_mut()?.take_request()
+    }
+
+    /// The phone is switching to `mode`: a fresh decoder for the new stream, new output sizes.
+    pub fn set_mode(&mut self, mode: Mode) -> Result<(), String> {
+        self.decoder = Decoder::new(&self.device, self.codec, mode.width, mode.height, mode.fps)
+            .map_err(|e| format!("decoder: {e}"))?;
+        self.mode = mode;
+        let picture = (mode.width, mode.height);
+        if let Some(c) = self.camera.as_mut() {
+            c.set_mode(picture, mode);
+        }
+        if let Some(p) = self.preview.as_mut() {
+            p.set_picture(picture);
+            p.set_title(&title(self.codec, mode));
+        }
+        Ok(())
     }
 
     pub fn packet(&mut self, data: &[u8], pts_us: u64, config: bool, keyframe: bool) -> Result<(), String> {
@@ -114,7 +140,11 @@ impl Viewer {
                 Some(c) if c.connected() => "  camera in use",
                 _ => "",
             };
-            p.set_title(&format!("{} — {text}{cam}", self.title));
+            p.set_title(&format!("{} — {text}{cam}", title(self.codec, self.mode)));
         }
     }
+}
+
+fn title(codec: Codec, mode: Mode) -> String {
+    format!("LensLink {mode} {}", codec.wire_name())
 }

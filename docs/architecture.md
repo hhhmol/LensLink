@@ -71,7 +71,7 @@ playing the stream into a user-installed virtual cable.
 2. **Stream MVP** — phone streams H.264 over ADB; PC saves it / plays it with `ffplay`. Measure latency. ✓
 3. **Rust host** — protocol, GPU decode (Media Foundation + DXVA), preview window (D3D11 video processor). ✓
 4. **Virtual camera** — Media Foundation media source + `MFCreateVirtualCamera`. ✓
-5. **Controls** — resolution, fps, lens, focus, exposure, ISO, WB from the tray app. ← next
+5. **Controls** — a) video modes from the phone, chosen by apps ✓; b) lens, focus, exposure, ISO, WB. ← next
 6. **Filters** — shader filters, then segmentation, then interpolation.
 7. **Polish** — auto-reconnect, autostart, installer, battery/thermal guards on the phone.
 
@@ -81,7 +81,13 @@ playing the stream into a user-installed virtual cable.
   `IMFMediaStream2`. The Frame Server service loads it in session 0 as LOCAL SERVICE and shares the
   camera between apps.
 - The host creates the camera with `MFCreateVirtualCamera` (session lifetime, current user), scales each
-  decoded frame on the GPU into a 1080p NV12 texture, reads it back and writes it to shared memory.
+  decoded frame on the GPU into an NV12 texture of the selected mode, reads it back and writes it to
+  shared memory (two slots sized for 4096x2304).
+- Modes (step 5a): the host asks the phone for `capabilities`, keeps the standard webcam sizes that
+  the camera, auto-exposure ranges and hardware encoder all support at 30/60 fps, and writes them to
+  `C:\ProgramData\LensLink\config\modes.txt` before creating the camera. The source offers one media
+  type per mode. When an app starts the stream, the source stores the selected type in shared memory;
+  the host sends the phone a new `start` and recreates its decoder.
 - Shared memory and its event live in `Global\`. Only a service may create global objects, so the
   camera side creates them with an ACL for interactive users; the host opens them while an app has the
   camera open and drops frames cheaply otherwise.

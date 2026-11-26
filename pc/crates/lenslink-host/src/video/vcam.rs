@@ -1,13 +1,14 @@
 //! Feeds decoded frames to the LensLink virtual camera.
 //!
 //! The camera exists while this object lives (`MFVirtualCameraLifetime_Session`). Each frame is scaled
-//! on the GPU into a 1080p NV12 texture (letterboxed when the phone sends another aspect ratio), read
-//! back, and published to the camera through shared memory. Frames are dropped cheaply while no app
-//! has the camera open, because then the camera side has not created the shared memory yet.
+//! on the GPU into an NV12 texture of the mode the app selected (letterboxed when the aspect ratio
+//! differs), read back, and published to the camera through shared memory. Frames are dropped cheaply
+//! while no app has the camera open, because then the camera side has not created the shared memory.
 
 use std::time::{Duration, Instant};
 
-use lenslink_vcam::shm::{SharedFrames, HEIGHT, WIDTH};
+use lenslink_vcam::modes::Mode;
+use lenslink_vcam::shm::SharedFrames;
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -22,25 +23,31 @@ pub struct VirtualCamera {
     camera: IMFVirtualCamera,
     frames: Option<SharedFrames>,
     next_try: Instant,
+    last_request: Option<Mode>,
+    device: ID3D11Device,
     context: ID3D11DeviceContext,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext1,
-    target: ID3D11Texture2D,
-    staging: ID3D11Texture2D,
-    scaler: Option<Scaler>,
+    /// Size of the frames published to the camera.
+    output: Mode,
     /// Visible picture size inside the padded decoder texture.
     picture: (u32, u32),
+    gpu: Option<Gpu>,
 }
 
-struct Scaler {
+/// Scaler and textures for one input/output size pair.
+struct Gpu {
     input_size: (u32, u32),
+    output_size: (u32, u32),
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     output_view: ID3D11VideoProcessorOutputView,
+    target: ID3D11Texture2D,
+    staging: ID3D11Texture2D,
 }
 
 impl VirtualCamera {
-    pub fn new(device: &ID3D11Device, picture: (u32, u32)) -> Result<Self, String> {
+    pub fn new(device: &ID3D11Device, picture: (u32, u32), output: Mode) -> Result<Self, String> {
         let camera = unsafe {
             MFCreateVirtualCamera(
                 MFVirtualCameraType_SoftwareCameraSource,
@@ -58,56 +65,42 @@ impl VirtualCamera {
                  as administrator once."
             )
         })?;
-
         let gpu = |e: windows::core::Error| format!("virtual camera GPU setup: {e}");
-        unsafe {
-            let nv12 = |usage, bind: D3D11_BIND_FLAG, cpu: D3D11_CPU_ACCESS_FLAG| D3D11_TEXTURE2D_DESC {
-                Width: WIDTH,
-                Height: HEIGHT,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: usage,
-                BindFlags: bind.0 as u32,
-                CPUAccessFlags: cpu.0 as u32,
-                MiscFlags: 0,
-            };
-            let mut target = None;
-            device
-                .CreateTexture2D(
-                    &nv12(D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_FLAG(0)),
-                    None,
-                    Some(&mut target),
-                )
-                .map_err(gpu)?;
-            let mut staging = None;
-            device
-                .CreateTexture2D(
-                    &nv12(D3D11_USAGE_STAGING, D3D11_BIND_FLAG(0), D3D11_CPU_ACCESS_READ),
-                    None,
-                    Some(&mut staging),
-                )
-                .map_err(gpu)?;
-            let context = device.GetImmediateContext().map_err(gpu)?;
-            Ok(VirtualCamera {
-                camera,
-                frames: None,
-                next_try: Instant::now(),
-                video_device: device.cast().map_err(gpu)?,
-                video_context: context.cast().map_err(gpu)?,
-                context,
-                target: target.unwrap(),
-                staging: staging.unwrap(),
-                scaler: None,
-                picture,
-            })
-        }
+        let context = unsafe { device.GetImmediateContext() }.map_err(gpu)?;
+        Ok(VirtualCamera {
+            camera,
+            frames: None,
+            next_try: Instant::now(),
+            last_request: None,
+            device: device.clone(),
+            video_device: device.cast().map_err(gpu)?,
+            video_context: context.cast().map_err(gpu)?,
+            context,
+            output,
+            picture,
+            gpu: None,
+        })
     }
 
-    /// Whether an app currently has the camera open (as far as we can tell).
+    /// Whether an app has had the camera open (as far as we can tell).
     pub fn connected(&self) -> bool {
         self.frames.is_some()
+    }
+
+    /// A mode an app newly selected, once per change.
+    pub fn take_request(&mut self) -> Option<Mode> {
+        let r = self.frames.as_ref()?.requested()?;
+        if self.last_request == Some(r) {
+            return None;
+        }
+        self.last_request = Some(r);
+        Some(r)
+    }
+
+    /// The phone now streams `picture`-sized frames; publish `output`-sized ones.
+    pub fn set_mode(&mut self, picture: (u32, u32), output: Mode) {
+        self.picture = picture;
+        self.output = output;
     }
 
     pub fn push(&mut self, frame: &Frame) -> windows::core::Result<()> {
@@ -126,19 +119,20 @@ impl VirtualCamera {
         }
         unsafe {
             self.scale(frame)?;
-            self.context.CopyResource(&self.staging, &self.target);
+            let g = self.gpu.as_ref().unwrap();
+            self.context.CopyResource(&g.staging, &g.target);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            self.context.Map(&g.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let src = mapped.pData as *const u8;
             let pitch = mapped.RowPitch as usize;
-            let (w, h) = (WIDTH as usize, HEIGHT as usize);
-            self.frames.as_ref().unwrap().publish(|dst| {
+            let (w, h) = (self.output.width as usize, self.output.height as usize);
+            self.frames.as_ref().unwrap().publish(self.output, |dst| {
                 // Luma rows, then the interleaved chroma plane, which starts after `h` padded rows.
                 for row in 0..h + h / 2 {
                     std::ptr::copy_nonoverlapping(src.add(row * pitch), dst.as_mut_ptr().add(row * w), w);
                 }
             });
-            self.context.Unmap(&self.staging, 0);
+            self.context.Unmap(&g.staging, 0);
         }
         Ok(())
     }
@@ -148,10 +142,12 @@ impl VirtualCamera {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             frame.texture.GetDesc(&mut desc);
             let input = (desc.Width, desc.Height);
-            if self.scaler.as_ref().is_none_or(|s| s.input_size != input) {
-                self.scaler = Some(self.create_scaler(input)?);
+            let output = (self.output.width, self.output.height);
+            if self.gpu.as_ref().is_none_or(|g| g.input_size != input || g.output_size != output) {
+                self.gpu = None;
+                self.gpu = Some(self.create_gpu(input, output)?);
             }
-            let s = self.scaler.as_ref().unwrap();
+            let g = self.gpu.as_ref().unwrap();
 
             let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
                 FourCC: 0,
@@ -162,17 +158,14 @@ impl VirtualCamera {
             };
             let mut in_view = None;
             self.video_device
-                .CreateVideoProcessorInputView(&frame.texture, &s.enumerator, &in_desc, Some(&mut in_view))?;
+                .CreateVideoProcessorInputView(&frame.texture, &g.enumerator, &in_desc, Some(&mut in_view))?;
 
             let (pw, ph) = (self.picture.0.min(input.0), self.picture.1.min(input.1));
             let vc = &self.video_context;
-            vc.VideoProcessorSetStreamSourceRect(&s.processor, 0, true, Some(&RECT {
-                left: 0,
-                top: 0,
-                right: pw as i32,
-                bottom: ph as i32,
-            }));
-            vc.VideoProcessorSetStreamDestRect(&s.processor, 0, true, Some(&super::preview::letterbox((pw, ph), (WIDTH, HEIGHT))));
+            let source = RECT { left: 0, top: 0, right: pw as i32, bottom: ph as i32 };
+            vc.VideoProcessorSetStreamSourceRect(&g.processor, 0, true, Some(&source));
+            let dest = super::preview::letterbox((pw, ph), output);
+            vc.VideoProcessorSetStreamDestRect(&g.processor, 0, true, Some(&dest));
 
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
@@ -180,21 +173,47 @@ impl VirtualCamera {
                 ..Default::default()
             };
             let streams = [stream];
-            let result = vc.VideoProcessorBlt(&s.processor, &s.output_view, 0, &streams);
+            let result = vc.VideoProcessorBlt(&g.processor, &g.output_view, 0, &streams);
             let [mut stream] = streams;
             std::mem::ManuallyDrop::drop(&mut stream.pInputSurface);
             result
         }
     }
 
-    unsafe fn create_scaler(&self, input: (u32, u32)) -> windows::core::Result<Scaler> {
+    unsafe fn create_gpu(&self, input: (u32, u32), output: (u32, u32)) -> windows::core::Result<Gpu> {
         unsafe {
+            let nv12 = |usage, bind: D3D11_BIND_FLAG, cpu: D3D11_CPU_ACCESS_FLAG| D3D11_TEXTURE2D_DESC {
+                Width: output.0,
+                Height: output.1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: usage,
+                BindFlags: bind.0 as u32,
+                CPUAccessFlags: cpu.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut target = None;
+            self.device.CreateTexture2D(
+                &nv12(D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_FLAG(0)),
+                None,
+                Some(&mut target),
+            )?;
+            let target = target.unwrap();
+            let mut staging = None;
+            self.device.CreateTexture2D(
+                &nv12(D3D11_USAGE_STAGING, D3D11_BIND_FLAG(0), D3D11_CPU_ACCESS_READ),
+                None,
+                Some(&mut staging),
+            )?;
+
             let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
                 InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
                 InputWidth: input.0,
                 InputHeight: input.1,
-                OutputWidth: WIDTH,
-                OutputHeight: HEIGHT,
+                OutputWidth: output.0,
+                OutputHeight: output.1,
                 Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
                 ..Default::default()
             };
@@ -206,12 +225,8 @@ impl VirtualCamera {
             vc.VideoProcessorSetStreamColorSpace1(&processor, 0, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
             vc.VideoProcessorSetOutputColorSpace1(&processor, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
             vc.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
-            vc.VideoProcessorSetOutputTargetRect(&processor, true, Some(&RECT {
-                left: 0,
-                top: 0,
-                right: WIDTH as i32,
-                bottom: HEIGHT as i32,
-            }));
+            let full = RECT { left: 0, top: 0, right: output.0 as i32, bottom: output.1 as i32 };
+            vc.VideoProcessorSetOutputTargetRect(&processor, true, Some(&full));
             let black = D3D11_VIDEO_COLOR {
                 Anonymous: D3D11_VIDEO_COLOR_0 {
                     YCbCr: D3D11_VIDEO_COLOR_YCbCrA { Y: 16.0 / 255.0, Cb: 0.5, Cr: 0.5, A: 1.0 },
@@ -225,8 +240,16 @@ impl VirtualCamera {
             };
             let mut output_view = None;
             self.video_device
-                .CreateVideoProcessorOutputView(&self.target, &enumerator, &out_desc, Some(&mut output_view))?;
-            Ok(Scaler { input_size: input, enumerator, processor, output_view: output_view.unwrap() })
+                .CreateVideoProcessorOutputView(&target, &enumerator, &out_desc, Some(&mut output_view))?;
+            Ok(Gpu {
+                input_size: input,
+                output_size: output,
+                enumerator,
+                processor,
+                output_view: output_view.unwrap(),
+                target,
+                staging: staging.unwrap(),
+            })
         }
     }
 }

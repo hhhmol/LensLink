@@ -31,6 +31,8 @@ present without vsync wait), same phone and mode, 4 screenshots: 165–265 ms, *
 That is within measurement noise of tuned ffplay: the PC side was already fast, most of the delay is
 on the phone (exposure, ISP, encoder) plus one 33 ms frame interval and the monitor refresh.
 
+4K30 H.264 on the Note 8T (step 4): steady 30 fps at ~50 Mbit/s over USB; after 2000 s only slightly warm.
+
 ## Consequences for the app
 
 - **Capabilities must be discovered at runtime.** Frame rates, stabilisation and lenses differ completely between devices.

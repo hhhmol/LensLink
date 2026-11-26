@@ -1,6 +1,7 @@
 //! LensLink Windows host.
 
 mod adb;
+mod modes;
 mod stream;
 mod video;
 

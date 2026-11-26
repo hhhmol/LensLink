@@ -1,6 +1,7 @@
 //! Opens the "LensLink" camera like any app does (through the Frame Server), reads frames and
-//! reports the frame rate. `cargo run -p lenslink-vcam --example grab -- [frames] [out.pgm]`
-//! saves the luma of the last frame as a greyscale PGM image.
+//! reports the frame rate. `cargo run -p lenslink-vcam --example grab -- [frames] [out.pgm] [WxH@FPS]`
+//! lists the camera's modes, optionally selects one, and saves the luma of the last frame as a
+//! greyscale PGM image.
 
 use std::time::Instant;
 
@@ -45,12 +46,26 @@ fn main() -> windows::core::Result<()> {
         let source: IMFMediaSource = activate.ActivateObject()?;
         let reader = MFCreateSourceReaderFromMediaSource(&source, None)?;
         let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+        let wanted = args.get(3).map(String::as_str);
+        let mut i = 0;
+        while let Ok(t) = reader.GetNativeMediaType(stream, i) {
+            let size = t.GetUINT64(&MF_MT_FRAME_SIZE)?;
+            let rate = t.GetUINT64(&MF_MT_FRAME_RATE)?;
+            let mode = format!("{}x{}@{}", size >> 32, size & 0xffff_ffff, (rate >> 32) / (rate & 0xffff_ffff).max(1));
+            println!("mode {i}: {mode}");
+            if wanted == Some(mode.as_str()) {
+                reader.SetCurrentMediaType(stream, None, &t)?;
+                println!("selected {mode}");
+            }
+            i += 1;
+        }
         let size = reader.GetCurrentMediaType(stream)?.GetUINT64(&MF_MT_FRAME_SIZE)?;
         let (w, h) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
         println!("format {w}x{h}");
 
         let mut start = None;
         let mut last = Vec::new();
+        let mut placeholders = 0;
         for _ in 0..frames {
             let mut flags = 0u32;
             let mut sample = None;
@@ -62,11 +77,18 @@ fn main() -> windows::core::Result<()> {
             let mut n = 0u32;
             buf.Lock(&mut p, None, Some(&mut n))?;
             last = std::slice::from_raw_parts(p, (w * h).min(n as usize)).to_vec();
+            // The placeholder is uniform grey 40.
+            if last.iter().step_by(4099).all(|&v| v == 40) {
+                placeholders += 1;
+            }
             buf.Unlock()?;
         }
         let secs = start.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let mean = last.iter().map(|&v| v as f64).sum::<f64>() / last.len().max(1) as f64;
-        println!("{frames} frames in {secs:.2} s = {:.1} fps, mean luma {mean:.0} (placeholder is 40)", (frames - 1) as f64 / secs);
+        println!(
+            "{frames} frames in {secs:.2} s = {:.1} fps, {placeholders} placeholder frames, last frame mean luma {mean:.0}",
+            (frames - 1) as f64 / secs
+        );
         if let Some(path) = args.get(2) {
             let mut out = format!("P5\n{w} {h}\n255\n").into_bytes();
             out.extend_from_slice(&last);

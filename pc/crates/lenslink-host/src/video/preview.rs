@@ -122,6 +122,10 @@ impl Preview {
         !CLOSED.with(Cell::get)
     }
 
+    pub fn set_picture(&mut self, picture: (u32, u32)) {
+        self.picture = picture;
+    }
+
     pub fn set_title(&self, title: &str) {
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(title));

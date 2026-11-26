@@ -17,6 +17,7 @@ $ErrorActionPreference = 'Stop'
 $dir = Join-Path $env:ProgramFiles 'LensLink'
 $target = Join-Path $dir 'lenslink_vcam.dll'
 $logs = Join-Path $env:ProgramData 'LensLink\logs'
+$config = Join-Path $env:ProgramData 'LensLink\config'
 
 # The Frame Server keeps the DLL loaded while apps use cameras. Stopping it releases the file;
 # Windows starts it again the next time an app opens a camera.
@@ -29,15 +30,18 @@ if (Test-Path $target) {
 }
 if ($Uninstall) {
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $env:ProgramData 'LensLink') -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host 'LensLink virtual camera removed.'
     return
 }
 
 if (-not (Test-Path $Dll)) { throw "Build it first: cd pc; cargo build --release  (missing $Dll)" }
-New-Item -ItemType Directory -Force $dir, $logs | Out-Null
+New-Item -ItemType Directory -Force $dir, $logs, $config | Out-Null
 Copy-Item $Dll $target -Force
 # LOCAL SERVICE (the Frame Server account) writes the log; users may read it.
 icacls $logs /grant '*S-1-5-19:(OI)(CI)M' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+# lenslink-host writes the phone's video modes here; the camera only reads them (strictly parsed).
+icacls $config /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
 
 $p = Start-Process regsvr32 -ArgumentList '/s', "`"$target`"" -Wait -PassThru
 if ($p.ExitCode -ne 0) { throw "regsvr32 failed with code $($p.ExitCode)" }

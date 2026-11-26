@@ -4,6 +4,7 @@
 //! `Global\` namespace. Only a service may create global objects, so the camera side creates them
 //! (with an ACL that lets interactive users write) and the host opens them, retrying until the camera
 //! is in use. Two frame slots: the host fills the one the camera is not reading, then publishes it.
+//! The camera writes back the mode the app chose, and the host switches the phone to it.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -22,25 +23,26 @@ use windows::Win32::System::Threading::{
     CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
 };
 
-/// The camera's only format for now: 1080p NV12. The host scales whatever the phone sends.
-pub const WIDTH: u32 = 1920;
-pub const HEIGHT: u32 = 1080;
-pub const FPS: u32 = 30;
-pub const FRAME_BYTES: usize = (WIDTH * HEIGHT * 3 / 2) as usize;
+use crate::modes::Mode;
+
+/// Largest frame a slot holds (NV12): DCI 4K, or UHD with room to spare.
+pub const MAX_WIDTH: u32 = 4096;
+pub const MAX_HEIGHT: u32 = 2304;
+const SLOT_BYTES: usize = (MAX_WIDTH * MAX_HEIGHT * 3 / 2) as usize;
 
 const MAPPING_NAME: &str = "Global\\LensLinkVirtualCamera";
 const EVENT_NAME: &str = "Global\\LensLinkVirtualCameraFrame";
 const MAGIC: u32 = u32::from_le_bytes(*b"LLVC");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_BYTES: usize = 4096;
-const TOTAL_BYTES: usize = HEADER_BYTES + 2 * FRAME_BYTES;
+const TOTAL_BYTES: usize = HEADER_BYTES + 2 * SLOT_BYTES;
 
 #[repr(C)]
 struct Header {
     magic: u32,
     version: u32,
-    width: u32,
-    height: u32,
+    slot_bytes: u32,
+    _pad0: u32,
     /// Frames published so far.
     seq: AtomicU64,
     /// Slot of the newest frame (0 or 1).
@@ -48,6 +50,10 @@ struct Header {
     _pad: u32,
     /// `GetTickCount64` of the last publish; 0 = never.
     written_ms: AtomicU64,
+    /// [`Mode::pack`] of the frame in each slot.
+    slot_mode: [AtomicU64; 2],
+    /// Mode the app selected, [`Mode::pack`]; 0 = none yet.
+    requested: AtomicU64,
 }
 
 pub struct SharedFrames {
@@ -93,8 +99,7 @@ impl SharedFrames {
                 let h = frames.view.Value as *mut Header;
                 (*h).magic = MAGIC;
                 (*h).version = VERSION;
-                (*h).width = WIDTH;
-                (*h).height = HEIGHT;
+                (*h).slot_bytes = SLOT_BYTES as u32;
             }
             Ok(frames)
         }
@@ -117,7 +122,7 @@ impl SharedFrames {
             };
             let frames = Self::map(mapping, event)?;
             let h = frames.header();
-            if h.magic != MAGIC || h.version != VERSION || h.width != WIDTH || h.height != HEIGHT {
+            if h.magic != MAGIC || h.version != VERSION || h.slot_bytes != SLOT_BYTES as u32 {
                 return Err(Error::new(
                     windows::Win32::Foundation::E_UNEXPECTED,
                     "the installed virtual camera DLL is a different version; reinstall it",
@@ -145,14 +150,16 @@ impl SharedFrames {
     }
 
     fn slot(&self, index: u32) -> *mut u8 {
-        unsafe { (self.view.Value as *mut u8).add(HEADER_BYTES + index as usize * FRAME_BYTES) }
+        unsafe { (self.view.Value as *mut u8).add(HEADER_BYTES + index as usize * SLOT_BYTES) }
     }
 
-    /// Host: writes a frame into the free slot, publishes it and wakes the camera.
-    pub fn publish(&self, fill: impl FnOnce(&mut [u8])) {
+    /// Host: writes a frame of `mode` into the free slot, publishes it and wakes the camera.
+    pub fn publish(&self, mode: Mode, fill: impl FnOnce(&mut [u8])) {
+        assert!(mode.is_valid(), "frame size {mode} does not fit the shared memory");
         let h = self.header();
         let back = h.latest.load(Ordering::Acquire) ^ 1;
-        fill(unsafe { std::slice::from_raw_parts_mut(self.slot(back), FRAME_BYTES) });
+        fill(unsafe { std::slice::from_raw_parts_mut(self.slot(back), mode.frame_bytes()) });
+        h.slot_mode[back as usize].store(mode.pack(), Ordering::Release);
         h.latest.store(back, Ordering::Release);
         h.seq.fetch_add(1, Ordering::AcqRel);
         h.written_ms.store(unsafe { GetTickCount64() }, Ordering::Release);
@@ -178,15 +185,37 @@ impl SharedFrames {
         }
     }
 
-    /// Camera: copies the newest frame. The host only overwrites this slot after it has filled the
-    /// other one, a whole frame interval later, so a copy (well under a millisecond) is never torn.
-    pub fn read(&self, dst: &mut [u8]) -> u64 {
+    /// Size of the newest frame, if any was published.
+    pub fn latest_size(&self) -> Option<(u32, u32)> {
+        let h = self.header();
+        let slot = h.latest.load(Ordering::Acquire) as usize;
+        Mode::unpack(h.slot_mode[slot & 1].load(Ordering::Acquire)).map(|m| (m.width, m.height))
+    }
+
+    /// Camera: copies the newest frame into `dst` (sized for `width`×`height` NV12) and returns its
+    /// sequence number, or `None` if the newest frame has another size (the host is still switching).
+    /// The host only overwrites this slot after it has filled the other one, a whole frame interval
+    /// later, so a copy (a few milliseconds even at 4K) is not torn.
+    pub fn read(&self, dst: &mut [u8], width: u32, height: u32) -> Option<u64> {
         let h = self.header();
         let seq = h.seq.load(Ordering::Acquire);
-        let slot = h.latest.load(Ordering::Acquire);
-        let n = dst.len().min(FRAME_BYTES);
-        unsafe { std::ptr::copy_nonoverlapping(self.slot(slot), dst.as_mut_ptr(), n) };
-        seq
+        let slot = h.latest.load(Ordering::Acquire) & 1;
+        let m = Mode::unpack(h.slot_mode[slot as usize].load(Ordering::Acquire))?;
+        if (m.width, m.height) != (width, height) || dst.len() < m.frame_bytes() {
+            return None;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(self.slot(slot), dst.as_mut_ptr(), m.frame_bytes()) };
+        Some(seq)
+    }
+
+    /// Camera: records the mode the app selected.
+    pub fn request(&self, mode: Mode) {
+        self.header().requested.store(mode.pack(), Ordering::Release);
+    }
+
+    /// Host: the mode the app selected, if any.
+    pub fn requested(&self) -> Option<Mode> {
+        Mode::unpack(self.header().requested.load(Ordering::Acquire))
     }
 }
 

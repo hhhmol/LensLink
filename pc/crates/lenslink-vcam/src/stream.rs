@@ -18,7 +18,8 @@ use windows_core::{implement, Interface, IUnknown, Ref, Result, GUID, HRESULT};
 
 use crate::attrs::{forward_attributes, raw};
 use crate::log::vlog;
-use crate::shm::{SharedFrames, FPS, FRAME_BYTES, HEIGHT, WIDTH};
+use crate::modes::Mode;
+use crate::shm::SharedFrames;
 
 /// A host frame older than this means the host stopped; switch to the placeholder.
 const HOST_TIMEOUT_MS: u64 = 1000;
@@ -29,6 +30,14 @@ struct State {
     shutdown: bool,
     delivered_seq: u64,
     last_delivery: Instant,
+    /// The media type the app selected.
+    mode: Mode,
+}
+
+impl State {
+    fn interval(&self) -> Duration {
+        Duration::from_micros(1_000_000 / self.mode.fps.max(1) as u64)
+    }
 }
 
 struct Shared {
@@ -46,18 +55,19 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn host_live(&self) -> bool {
-        self.frames
-            .as_ref()
-            .and_then(SharedFrames::age_ms)
-            .is_some_and(|age| age < HOST_TIMEOUT_MS)
+    /// The host is publishing frames of the selected size.
+    fn host_live(&self, mode: Mode) -> bool {
+        self.frames.as_ref().is_some_and(|f| {
+            f.age_ms().is_some_and(|age| age < HOST_TIMEOUT_MS) && f.latest_size() == Some((mode.width, mode.height))
+        })
     }
 
     /// Answers pending requests that can be answered now.
     fn serve(&self, st: &mut State, placeholder_due: bool) {
         while st.running && !st.pending.is_empty() {
-            let fresh = self.host_live() && self.frames.as_ref().is_some_and(|f| f.seq() > st.delivered_seq);
-            if !(fresh || (!self.host_live() && placeholder_due)) {
+            let live = self.host_live(st.mode);
+            let fresh = live && self.frames.as_ref().is_some_and(|f| f.seq() > st.delivered_seq);
+            if !(fresh || (!live && placeholder_due)) {
                 return;
             }
             if let Err(e) = self.deliver(st, fresh) {
@@ -72,22 +82,28 @@ impl Shared {
 
     fn deliver(&self, st: &mut State, from_host: bool) -> Result<()> {
         let token = st.pending.pop_front().flatten();
+        let m = st.mode;
+        let bytes = m.frame_bytes();
         unsafe {
-            let buffer = MFCreateMemoryBuffer(FRAME_BYTES as u32)?;
+            let buffer = MFCreateMemoryBuffer(bytes as u32)?;
             let mut p = std::ptr::null_mut();
             buffer.Lock(&mut p, None, None)?;
-            let dst = std::slice::from_raw_parts_mut(p, FRAME_BYTES);
-            match (&self.frames, from_host) {
-                (Some(f), true) => st.delivered_seq = f.read(dst),
-                _ => placeholder(dst),
+            let dst = std::slice::from_raw_parts_mut(p, bytes);
+            let read = match (&self.frames, from_host) {
+                (Some(f), true) => f.read(dst, m.width, m.height),
+                _ => None,
+            };
+            match read {
+                Some(seq) => st.delivered_seq = seq,
+                None => placeholder(dst, m),
             }
             buffer.Unlock()?;
-            buffer.SetCurrentLength(FRAME_BYTES as u32)?;
+            buffer.SetCurrentLength(bytes as u32)?;
 
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime(MFGetSystemTime())?;
-            sample.SetSampleDuration(10_000_000 / FPS as i64)?;
+            sample.SetSampleDuration(10_000_000 / m.fps.max(1) as i64)?;
             if let Some(t) = &token {
                 sample.SetUnknown(&MFSampleExtension_Token, t)?;
             }
@@ -99,15 +115,15 @@ impl Shared {
 }
 
 /// Dark grey frame: shows that the camera works but the phone is not streaming.
-fn placeholder(dst: &mut [u8]) {
-    let luma = (WIDTH * HEIGHT) as usize;
+fn placeholder(dst: &mut [u8], m: Mode) {
+    let luma = (m.width * m.height) as usize;
     dst[..luma].fill(40);
     dst[luma..].fill(128);
 }
 
 fn worker(shared: Arc<Shared>) {
-    let interval = Duration::from_millis(1000 / FPS as u64);
     loop {
+        let interval = shared.lock().interval();
         match &shared.frames {
             Some(f) => {
                 f.wait(interval.as_millis() as u32 / 2);
@@ -118,7 +134,7 @@ fn worker(shared: Arc<Shared>) {
         if st.shutdown {
             return;
         }
-        let due = st.last_delivery.elapsed() >= interval;
+        let due = st.last_delivery.elapsed() >= st.interval();
         shared.serve(&mut st, due);
     }
 }
@@ -133,7 +149,7 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn new(descriptor: IMFStreamDescriptor, attrs: IMFAttributes) -> Result<Self> {
+    pub fn new(descriptor: IMFStreamDescriptor, attrs: IMFAttributes, mode: Mode) -> Result<Self> {
         let frames = match SharedFrames::create() {
             Ok(f) => Some(f),
             Err(e) => {
@@ -150,6 +166,7 @@ impl Stream {
                 shutdown: false,
                 delivered_seq: 0,
                 last_delivery: Instant::now(),
+                mode,
             }),
         });
         let w = shared.clone();
@@ -168,6 +185,16 @@ impl Stream {
 
     pub fn set_source(&self, source: IMFMediaSource) {
         *self.source.lock().unwrap() = Some(source);
+    }
+
+    /// The app selected `mode`: deliver that size and ask the host to switch the phone to it.
+    pub fn set_mode(&self, mode: Mode) {
+        let mut st = self.shared.lock();
+        st.mode = mode;
+        if let Some(f) = &self.shared.frames {
+            f.request(mode);
+        }
+        vlog!("app selected {mode}");
     }
 
     pub fn attributes(&self) -> IMFAttributes {
@@ -265,7 +292,7 @@ impl IMFMediaStream_Impl for Stream_Impl {
             return Err(MF_E_MEDIA_SOURCE_WRONGSTATE.into());
         }
         st.pending.push_back(token.as_ref().cloned());
-        let due = st.last_delivery.elapsed() >= Duration::from_millis(1000 / FPS as u64);
+        let due = st.last_delivery.elapsed() >= st.interval();
         self.shared.serve(&mut st, due);
         Ok(())
     }
