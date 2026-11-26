@@ -156,3 +156,98 @@ impl Glass {
         }
     }
 }
+
+/// Draws a scene exported from the prototype (`scene.json` and its background `bg.bgra`, raw BGRA,
+/// in the folder `LENSLINK_GLASS_SCENE`) with this shader into `native.bgra`, to compare the two
+/// pixel by pixel. Needs a GPU: `cargo test glass_draws_the_prototype_scene -- --ignored`.
+#[cfg(test)]
+mod compare {
+    use super::*;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    fn texture(device: &ID3D11Device, w: u32, h: u32, usage: D3D11_USAGE, bind: u32, cpu: u32, data: Option<&[u8]>) -> ID3D11Texture2D {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: usage,
+            BindFlags: bind,
+            CPUAccessFlags: cpu,
+            MiscFlags: 0,
+        };
+        let init = data.map(|d| D3D11_SUBRESOURCE_DATA { pSysMem: d.as_ptr().cast(), SysMemPitch: w * 4, SysMemSlicePitch: 0 });
+        let mut t = None;
+        unsafe { device.CreateTexture2D(&desc, init.as_ref().map(|i| i as *const _), Some(&mut t)) }.unwrap();
+        t.unwrap()
+    }
+
+    #[test]
+    #[ignore]
+    fn glass_draws_the_prototype_scene() {
+        let dir = std::path::PathBuf::from(std::env::var("LENSLINK_GLASS_SCENE").expect("LENSLINK_GLASS_SCENE"));
+        let scene: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("scene.json")).unwrap()).unwrap();
+        let f = |v: &serde_json::Value| v.as_f64().unwrap() as f32;
+        let (w, h) = (scene["R"][0].as_u64().unwrap() as u32, scene["R"][1].as_u64().unwrap() as u32);
+        let bg = std::fs::read(dir.join("bg.bgra")).unwrap();
+        assert_eq!(bg.len(), (w * h * 4) as usize);
+
+        let mut device = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let device = device.unwrap();
+        let video = texture(&device, w, h, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE.0 as u32, 0, Some(&bg));
+        let target = texture(&device, w, h, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET.0 as u32, 0, None);
+        let staging = texture(&device, w, h, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32, None);
+        let mut view = None;
+        unsafe { device.CreateRenderTargetView(&target, None, Some(&mut view)) }.unwrap();
+
+        let n = scene["N"].as_u64().unwrap() as usize;
+        let mut c = Constants {
+            size: [w as f32, h as f32],
+            px: f(&scene["PX"]),
+            lens: f(&scene["S"]),
+            dispersion: f(&scene["D"]),
+            theme: f(&scene["TH"]),
+            curtain_tint: f(&scene["TI"]),
+            count: n as f32,
+            video: [0.0, 0.0, w as f32, h as f32],
+            ..Default::default()
+        };
+        for i in 0..n {
+            c.boxes[i] = std::array::from_fn(|k| f(&scene["B"][i * 4 + k]));
+            c.corners[i] = [f(&scene["Rd"][i]), f(&scene["Cp"][i]), 0.0, 0.0];
+        }
+        let mut glass = Glass::new(&device).unwrap();
+        unsafe {
+            glass.draw(view.as_ref().unwrap(), Some(&video), &c).unwrap();
+            let ctx = device.GetImmediateContext().unwrap();
+            ctx.CopyResource(&staging, &target);
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).unwrap();
+            let mut out = Vec::with_capacity(bg.len());
+            for y in 0..h as usize {
+                let row = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), w as usize * 4);
+                out.extend_from_slice(row);
+            }
+            ctx.Unmap(&staging, 0);
+            std::fs::write(dir.join("native.bgra"), out).unwrap();
+        }
+    }
+}

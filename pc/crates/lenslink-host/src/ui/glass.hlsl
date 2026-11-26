@@ -33,6 +33,8 @@ float4 vs(uint id : SV_VertexID) : SV_Position
 
 float3 tex(float2 p)
 {
+    // Refraction looks past the window's edge: the picture's edge continues there.
+    p = clamp(p, 0.5, R - 0.5);
     float2 uv = (p - VR.xy) / max(VR.zw, 1);
     if (VR.z <= 0 || any(uv < 0) || any(uv > 1))
         return BG.rgb;
