@@ -1,6 +1,7 @@
 //! The window's floating glass: the caption buttons and the status. They come and go like drops:
 //! each grows from its centre on a spring, overshoots a little and settles; buttons swell under the
-//! pointer and give when pressed. Positions are in DIPs.
+//! pointer and give when pressed. Positions are in DIPs, within the video left free by the
+//! curtains: the buttons and the status ride along with the curtains' edges.
 
 use super::render::{Element, Label};
 
@@ -17,14 +18,17 @@ const MARGIN: f32 = 12.0;
 /// Room around a label inside its pill.
 const PAD: (f32, f32) = (28.0, 14.0);
 
-fn button_centre(b: Button, width: f32) -> (f32, f32) {
-    let right = width - MARGIN - if b == Button::Minimize { BUTTON + BUTTON_GAP } else { 0.0 };
-    (right - BUTTON / 2.0, MARGIN + BUTTON / 2.0)
+/// The part of the window the curtains leave to the video: left, top, right, bottom.
+pub type Area = (f32, f32, f32, f32);
+
+fn button_centre(b: Button, area: Area) -> (f32, f32) {
+    let right = area.2 - MARGIN - if b == Button::Minimize { BUTTON + BUTTON_GAP } else { 0.0 };
+    (right - BUTTON / 2.0, area.1 + MARGIN + BUTTON / 2.0)
 }
 
-pub fn button_at(x: f32, y: f32, width: f32) -> Option<Button> {
+pub fn button_at(x: f32, y: f32, area: Area) -> Option<Button> {
     [Button::Minimize, Button::Close].into_iter().find(|&b| {
-        let (cx, cy) = button_centre(b, width);
+        let (cx, cy) = button_centre(b, area);
         // A little slack around each button.
         (x - cx).abs() <= BUTTON / 2.0 + 3.0 && (y - cy).abs() <= BUTTON / 2.0 + 3.0
     })
@@ -106,12 +110,12 @@ impl Pill {
 
 /// What the overlay shows now.
 pub struct Input<'a> {
-    pub size: (f32, f32),
+    pub area: Area,
     /// The pointer is over the window.
     pub hover: bool,
     pub hot: Option<Button>,
     pub pressed: Option<Button>,
-    /// Frames are arriving: the status is a statistics line, shown only on hover.
+    /// Frames are arriving: the status (a statistics line) is left to the widgets.
     pub live: bool,
     pub status: &'a str,
 }
@@ -123,8 +127,6 @@ pub struct Overlay {
     press: [Spring; 2],
     /// The status in the middle when there is nothing to watch.
     big: Pill,
-    /// The statistics line, bottom left, on hover.
-    small: Pill,
 }
 
 /// Labels fade in once their drop is big enough to hold them.
@@ -140,7 +142,7 @@ impl Overlay {
     /// Advances the animation by `dt` seconds. `measure` gives a text's size in DIPs (large or small
     /// font, wrapped at a width). Returns whether anything still moves.
     pub fn step(&mut self, dt: f32, input: &Input, measure: impl Fn(&str, bool, f32) -> (f32, f32)) -> bool {
-        let (w, _) = input.size;
+        let w = input.area.2 - input.area.0;
         let mut moving = self.caption.step(if input.hover { 1.0 } else { 0.0 }, dt, SHOW.0, SHOW.1);
         for b in [Button::Minimize, Button::Close] {
             let i = index(b);
@@ -149,12 +151,11 @@ impl Overlay {
         }
         let wrap = |max: f32| (max - PAD.0).max(40.0);
         moving |= self.big.step(!input.live, input.status, wrap(w - 64.0), |t, wr| measure(t, true, wr), dt);
-        moving |= self.small.step(input.live && input.hover, input.status, wrap(w - 2.0 * MARGIN), |t, wr| measure(t, false, wr), dt);
         moving
     }
 
-    pub fn elements(&self, size: (f32, f32)) -> Vec<Element<'_>> {
-        let (w, h) = size;
+    pub fn elements(&self, area: Area) -> Vec<Element<'_>> {
+        let (left, top, right, bottom) = area;
         let mut out = Vec::new();
         fn pill(p: &Pill, centre: (f32, f32), large: bool) -> Element<'_> {
             Element {
@@ -166,11 +167,7 @@ impl Overlay {
             }
         }
         if self.big.shown.x > 0.04 {
-            out.push(pill(&self.big, (w / 2.0, h / 2.0), true));
-        }
-        if self.small.shown.x > 0.04 {
-            let s = &self.small;
-            out.push(pill(s, (MARGIN + s.w.x / 2.0, h - MARGIN - s.h.x / 2.0), false));
+            out.push(pill(&self.big, ((left + right) / 2.0, (top + bottom) / 2.0), true));
         }
 
         if self.caption.x > 0.04 {
@@ -183,7 +180,7 @@ impl Overlay {
                     Button::Minimize => [1.0, 1.0, 1.0, (0.14 * hot + 0.1 * press).clamp(0.0, 1.0)],
                 };
                 out.push(Element {
-                    centre: button_centre(b, w),
+                    centre: button_centre(b, area),
                     half: (r, r),
                     tint,
                     label: Label::Glyph(glyph),
@@ -218,12 +215,16 @@ mod tests {
 
     #[test]
     fn buttons_are_found_with_a_little_slack() {
-        let w = 800.0;
-        let (cx, cy) = button_centre(Button::Close, w);
-        assert_eq!(button_at(cx, cy, w), Some(Button::Close));
-        assert_eq!(button_at(cx - 17.0, cy, w), Some(Button::Close));
-        let (mx, _) = button_centre(Button::Minimize, w);
-        assert_eq!(button_at(mx, cy + 17.0, w), Some(Button::Minimize));
-        assert_eq!(button_at(w / 2.0, cy, w), None);
+        let a = (0.0, 0.0, 800.0, 450.0);
+        let (cx, cy) = button_centre(Button::Close, a);
+        assert_eq!(button_at(cx, cy, a), Some(Button::Close));
+        assert_eq!(button_at(cx - 17.0, cy, a), Some(Button::Close));
+        let (mx, _) = button_centre(Button::Minimize, a);
+        assert_eq!(button_at(mx, cy + 17.0, a), Some(Button::Minimize));
+        assert_eq!(button_at(400.0, cy, a), None);
+        // An open curtain on the right takes the buttons along.
+        let b = (0.0, 0.0, 500.0, 450.0);
+        assert_eq!(button_at(cx, cy, b), None);
+        assert_eq!(button_at(cx - 300.0, cy, b), Some(Button::Close));
     }
 }

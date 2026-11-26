@@ -75,7 +75,8 @@ playing the stream into a user-installed virtual cable.
 6. **Filters** — shader filters, then segmentation, then interpolation.
 7. **Polish** ← now — a) auto-reconnect and autostart of the phone service ✓; b) stream only while an
    app uses the camera, adb device events instead of polling ✓; c) the app: 1. tray, borderless
-   window, own window thread ✓; 2. liquid glass shader ✓; 3. settings curtains; 4. widgets on the video;
+   window, own window thread ✓; 2. liquid glass shader ✓; 3. settings curtains ✓; 4. widgets on the
+   video ✓ (still to come: the theme following Windows);
    d) installer; e) battery/thermal guards on the phone.
 
 ## Virtual camera internals (step 4)
@@ -170,5 +171,26 @@ window (`ui` module), and the virtual camera when it is installed.
   Elements come and go on damped springs (a drop's small overshoot), so the window redraws at the
   display's rate only while something moves and at the video's 30 fps otherwise. Inside Windows'
   own loop for moving and sizing, a timer keeps animations going.
+- **Curtains.** Each window edge is a string of 48 springs (`curtain.rs`): pulled, it follows the
+  pointer softly; let go, it snaps open or shut and the flick runs along it as a wave; under the
+  pointer it bulges. At rest it lies just outside the window. The panels (`panel.rs`: rows, values,
+  layout, hit-testing with an invisible halo around each control) are drawn with Direct2D into one
+  atlas texture only when they change; the shader looks them up through the edge's bend, so text
+  curves with the wave, and frosts the curtain with a blurred quarter-size copy of the picture. The
+  caption buttons and the status ride along with the curtains' edges. All settings are saved under
+  `values` in `settings.json`; the camera ones go to the phone as a `set` message, the video ones
+  (resolution, rate, bit rate) restart its stream. Resolution and rate offer only the modes the phone
+reported (a rate follows its resolution), quality ends at the encoder's bit rate ceiling. Exposure,
+ISO and white balance are automatic at their slider's left end (a notch before the lowest value).
+The cursor is chosen from the pointer's position when Windows asks, not from the last mouse
+message: at a screen's edge the pointer stops and that message can be a move behind.
+- **Widgets.** Grabbed by its name on a curtain, an item comes out as a glass pill with its control
+  or value (`widgets.rs`); it follows the pointer on a spring, stretches as it moves, merges with
+  other glass and goes back into an open curtain when dropped there. Widgets are saved as positions
+  relative to the window. The right curtain holds what the stream tells: the phone's model, the mode,
+  the stream's figures of the last second (time, frames per second, bit rate, keyframes, longest pause
+  between frames) and, from the phone's `status` message every 5 s, battery charge and temperature.
+  "Manual" focus holds the lens where autofocus last put it (`focus_hold`). The glass and the curtains were
+  checked against the prototype pixel by pixel (an ignored test draws a scene exported from it).
 - Settings live in `%APPDATA%\LensLink\settings.json` (unknown keys survive a save), the log in
   `lenslink.log` next to it. A named mutex keeps one instance; a second start shows the first window.

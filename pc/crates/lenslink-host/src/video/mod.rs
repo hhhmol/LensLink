@@ -111,6 +111,11 @@ impl Viewer {
         self.preview.as_mut().is_none_or(Preview::pump) && self.app.as_ref().is_none_or(|a| !a.quit_requested())
     }
 
+    /// The app's window, when there is one.
+    pub fn app(&self) -> Option<&crate::ui::Link> {
+        self.app.as_ref()
+    }
+
     pub fn has_camera(&self) -> bool {
         self.camera.is_some()
     }

@@ -49,6 +49,8 @@ class CameraStreamer(
     /** Last values chosen by auto-exposure; the start point when only one manual value is given. */
     private var lastExposureNs = 1_000_000_000L / 60
     private var lastIso = 400
+    /** Where autofocus last put the lens, for holding focus there. */
+    private var lastFocusDiopters: Float? = null
 
     @Volatile
     private var stopped = false
@@ -227,7 +229,7 @@ class CameraStreamer(
         }
 
         val afModes = ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
-        val focus = c.focusDiopters
+        val focus = c.focusDiopters ?: lastFocusDiopters.takeIf { c.focusHold }
         if (focus != null && afModes.contains(CameraMetadata.CONTROL_AF_MODE_OFF)) {
             // Xiaomi does not report the minimum focus distance; 10 diopters (10 cm) is a safe ceiling.
             val nearest = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)?.takeIf { it > 0f } ?: 10f
@@ -295,6 +297,9 @@ class CameraStreamer(
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            if (result.get(TotalCaptureResult.CONTROL_AF_MODE) != CameraMetadata.CONTROL_AF_MODE_OFF) {
+                result.get(TotalCaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocusDiopters = it }
+            }
             if (result.get(TotalCaptureResult.CONTROL_AE_MODE) == CameraMetadata.CONTROL_AE_MODE_OFF) return
             result.get(TotalCaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExposureNs = it }
             result.get(TotalCaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }

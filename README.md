@@ -33,8 +33,8 @@ Pre-alpha, steps 1–5 of the [roadmap](docs/architecture.md#roadmap) done, step
   LensLink, and stops 5 s after the last one closes it. Idle, the host uses no measurable CPU and the
   phone keeps no wake lock;
 - the **LensLink app** (`LensLink.exe`): a borderless window with the video that lives in the tray,
-  connects to the phone and publishes the virtual camera by itself. Its liquid-glass controls are
-  being built.
+  connects to the phone and publishes the virtual camera by itself. Its controls are liquid glass:
+  settings in four elastic curtains, any of them pulled out onto the video as a widget.
 
 Not yet: the settings in the app, filters, an installer.
 
@@ -84,7 +84,12 @@ cargo build --release
 ```
 
 The window shows the phone's camera. Drag it anywhere on the video, resize it at the corners,
-double-click to maximise. Closing it (×, Esc) keeps LensLink in the tray: click the tray icon to bring
+double-click to maximise. Settings hide behind the window's edges: pull an edge to open its curtain
+(left: the camera; right: the phone and the stream; top: the video and the look; bottom: the
+curtains' own motion and glass). Grab an item by its name and drop it on the video to keep it there
+as a widget; drop a widget back onto an open curtain to put it away. Exposure, ISO and white
+balance are automatic at their slider's left end. Resolution and frame rate offer only what the
+phone can stream; quality goes up to what its encoder takes. Closing it (×, Esc) keeps LensLink in the tray: click the tray icon to bring
 the window back, right-click it to quit. While the window is hidden the phone's camera runs only if an
 app uses the virtual camera (install it once, see below; without it the app works with the window
 only). `LensLink.exe --hidden` starts in the tray. Settings are in `%APPDATA%\LensLink\settings.json`,

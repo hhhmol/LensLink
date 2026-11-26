@@ -392,21 +392,48 @@ impl Host<'_> {
         self.say("phone connected");
 
         let mut phone_mode = self.output;
-        if o.virtual_camera {
+        // The bit rate the window asks for, if any.
+        let mut phone_bitrate = None;
+        let app = o.player == Player::App;
+        if o.virtual_camera || app {
             send_control(&mut writer, &json!({ "type": "get_capabilities" }))?;
-            let caps = wait_for_capabilities(&mut reader)?;
+            let (caps, others) = wait_for_capabilities(&mut reader)?;
+            for m in &others {
+                self.phone_message(m);
+            }
             let offered = modes::from_capabilities(&caps, &o.camera, o.codec)
                 .map_err(|e| Fail::Retry(e, Duration::from_secs(5)))?;
             self.camera_modes(offered).map_err(Fail::Fatal)?;
-            phone_mode = modes::closest(&self.offered, self.output);
+            let (want, bitrate) = self.wanted();
+            phone_mode = modes::closest(&self.offered, want);
+            phone_bitrate = bitrate;
             let descs = controls::from_capabilities(&caps, &o.camera);
-            lenslink_vcam::controls::write(&descs)
-                .map_err(|e| Fail::Fatal(format!("cannot write {} ({e})", lenslink_vcam::controls::CONTROLS_PATH)))?;
-            eprintln!("camera controls: {}", descs.iter().map(|d| d.control.name()).collect::<Vec<_>>().join(", "));
+            if o.virtual_camera {
+                lenslink_vcam::controls::write(&descs)
+                    .map_err(|e| Fail::Fatal(format!("cannot write {} ({e})", lenslink_vcam::controls::CONTROLS_PATH)))?;
+                eprintln!("camera controls: {}", descs.iter().map(|d| d.control.name()).collect::<Vec<_>>().join(", "));
+            }
+            if let Some(a) = self.viewer.as_ref().and_then(Viewer::app) {
+                let range = |c: lenslink_vcam::controls::Control, scale: f32| {
+                    descs.iter().find(|d| d.control == c).map(|d| (d.min as f32 / scale, d.max as f32 / scale))
+                };
+                use lenslink_vcam::controls::Control;
+                let modes = self.offered.clone();
+                let max_mbits = modes::max_bitrate(&caps, o.codec).map(|b| b as f32 / 1e6);
+                a.info(|i| {
+                    i.zoom = range(Control::Zoom, 10.0);
+                    i.ev = range(Control::Brightness, 10.0);
+                    i.iso = range(Control::Gain, 1.0);
+                    i.modes = modes;
+                    i.max_mbits = max_mbits;
+                });
+            }
             if let Some(v) = self.viewer.as_mut() {
                 v.set_controls(descs);
             }
         }
+        // The window's camera settings go to the phone once it is connected, after what apps set.
+        let mut app_controls_sent = 0;
         if let Some(v) = self.viewer.as_mut() {
             v.set_output(self.output);
             // The phone starts with automatic settings; restore what apps set.
@@ -442,16 +469,24 @@ impl Host<'_> {
                 let mut restart = false;
                 if let Some(r) = self.viewer.as_mut().and_then(Viewer::take_request) {
                     self.select(r);
-                    let p = modes::closest(&self.offered, r);
-                    restart = p != phone_mode;
+                }
+                // The window's choice, else what an app selected on the virtual camera.
+                let (want, bitrate) = self.wanted();
+                let p = modes::closest(&self.offered, want);
+                if p != phone_mode || bitrate != phone_bitrate {
+                    restart = streaming;
                     phone_mode = p;
+                    phone_bitrate = bitrate;
                 }
                 if self.watched() {
                     last_watched = Instant::now();
                     restart |= !streaming;
                 }
                 if restart && last_watched.elapsed() < IDLE_GRACE {
-                    send_control(&mut writer, &start_message(o, phone_mode))?;
+                    send_control(&mut writer, &start_message(o, phone_mode, phone_bitrate))?;
+                    if let Some(a) = self.viewer.as_ref().and_then(Viewer::app) {
+                        a.info(|i| i.mode = Some(phone_mode));
+                    }
                     if let Some(v) = self.viewer.as_mut() {
                         v.set_stream(phone_mode).map_err(|e| Fail::Fatal(format!("starting {phone_mode}: {e}")))?;
                     }
@@ -463,6 +498,12 @@ impl Host<'_> {
                 } else if streaming && last_watched.elapsed() >= IDLE_GRACE {
                     send_control(&mut writer, &json!({ "type": "stop" }))?;
                     streaming = false;
+                    if let Some(a) = self.viewer.as_ref().and_then(Viewer::app) {
+                        a.info(|i| {
+                            i.mode = None;
+                            i.stats = None;
+                        });
+                    }
                     if io::stderr().is_terminal() {
                         eprintln!();
                     }
@@ -470,6 +511,10 @@ impl Host<'_> {
                 }
                 if let Some(values) = self.viewer.as_mut().and_then(Viewer::take_controls) {
                     let msg = controls::to_phone(&values);
+                    eprintln!("controls: {msg}");
+                    send_control(&mut writer, &msg)?;
+                }
+                if let Some(msg) = self.viewer.as_ref().and_then(Viewer::app).and_then(|a| a.take_controls(&mut app_controls_sent)) {
                     eprintln!("controls: {msg}");
                     send_control(&mut writer, &msg)?;
                 }
@@ -496,6 +541,7 @@ impl Host<'_> {
                             self.user_stopped = true;
                             return Ok(End::Lost(STOPPED.into(), Duration::from_secs(2)));
                         }
+                        self.phone_message(&msg);
                     }
                     Kind::Video => {
                         last_video = Instant::now();
@@ -513,9 +559,12 @@ impl Host<'_> {
                         if let Some(v) = self.viewer.as_mut() {
                             v.packet(&packet.payload, h.pts_us, h.has(flags::CONFIG), h.has(flags::KEYFRAME))?;
                         }
-                        if let Some(line) = stats.add(h, packet.payload.len()) {
+                        if let Some((line, figures)) = stats.add(h, packet.payload.len()) {
                             if let Some(v) = self.viewer.as_ref() {
                                 v.status(&line);
+                                if let Some(a) = v.app() {
+                                    a.info(|i| i.stats = Some(figures));
+                                }
                             }
                         }
                     }
@@ -525,6 +574,15 @@ impl Host<'_> {
         })();
         // Unblocks the reader thread.
         let _ = writer.shutdown(std::net::Shutdown::Both);
+        if let Some(a) = self.viewer.as_ref().and_then(Viewer::app) {
+            // What the phone can do stays known; what it does now goes.
+            a.info(|i| {
+                i.mode = None;
+                i.stats = None;
+                i.battery = None;
+                i.temperature = None;
+            });
+        }
         if let Some(mut p) = ffplay {
             let _ = p.kill();
         }
@@ -574,6 +632,31 @@ impl Host<'_> {
         }
     }
 
+    /// The mode to ask the phone for (before picking the closest it offers) and the bit rate: what
+    /// the app's window chose, else what the virtual camera publishes.
+    fn wanted(&self) -> (Mode, Option<u32>) {
+        match self.viewer.as_ref().and_then(Viewer::app).and_then(crate::ui::Link::video) {
+            Some((mode, bitrate)) => (mode, Some(bitrate)),
+            None => (self.output, None),
+        }
+    }
+
+    /// What the phone tells about itself, for the app's widgets.
+    fn phone_message(&self, msg: &Value) {
+        let Some(a) = self.viewer.as_ref().and_then(Viewer::app) else { return };
+        match msg["type"].as_str() {
+            Some("device_info") => {
+                let model = msg["model"].as_str().unwrap_or_default().to_string();
+                a.info(|i| i.phone = model);
+            }
+            Some("status") => a.info(|i| {
+                i.battery = msg["battery"].as_u64().map(|b| (b as u32, msg["charging"].as_bool().unwrap_or(false)));
+                i.temperature = msg["temperature"].as_f64().map(|t| t as f32);
+            }),
+            _ => {}
+        }
+    }
+
     /// Writes the phone's modes for the virtual camera when they changed (first connection, other
     /// phone). The first line is the camera's default mode.
     fn camera_modes(&mut self, offered: Vec<Mode>) -> Result<(), String> {
@@ -593,6 +676,10 @@ impl Host<'_> {
         }
         let mut list = vec![default];
         list.extend(offered.iter().copied().filter(|m| *m != default));
+        if !self.o.virtual_camera {
+            self.offered = offered;
+            return Ok(());
+        }
         lenslink_vcam::modes::write(&list).map_err(|e| {
             format!(
                 "cannot write {} ({e}). Reinstall the virtual camera: tools/install-vcam.ps1",
@@ -605,8 +692,9 @@ impl Host<'_> {
     }
 }
 
-fn start_message(o: &Options, mode: Mode) -> Value {
-    let bitrate = o.bitrate.unwrap_or_else(|| modes::bitrate(mode));
+/// `bitrate`: what the app's window chose; else the command line's, else one that suits the mode.
+fn start_message(o: &Options, mode: Mode, bitrate: Option<u32>) -> Value {
+    let bitrate = bitrate.or(o.bitrate).unwrap_or_else(|| modes::bitrate(mode));
     let mut start = json!({
         "type": "start",
         "camera_id": o.camera,
@@ -641,21 +729,24 @@ fn control_message(payload: &[u8]) -> Result<Value, String> {
             msg["model"].as_str().unwrap_or("?"),
             msg["android"].as_str().unwrap_or("?")
         ),
-        Some("capabilities" | "stopped") => {}
+        Some("capabilities" | "stopped" | "status") => {}
         _ => eprintln!("phone: {text}"),
     }
     Ok(msg)
 }
 
-/// Reads until the phone answers `get_capabilities` (nothing is streaming yet).
-fn wait_for_capabilities(reader: &mut impl io::Read) -> Result<Value, String> {
+/// Reads until the phone answers `get_capabilities` (nothing is streaming yet); also returns the
+/// other messages that came first.
+fn wait_for_capabilities(reader: &mut impl io::Read) -> Result<(Value, Vec<Value>), String> {
+    let mut others = Vec::new();
     loop {
         match proto::read_packet(reader) {
             Ok(Some(p)) if p.header.kind == Kind::Control => {
                 let msg = control_message(&p.payload)?;
                 if msg["type"] == "capabilities" {
-                    return Ok(msg);
+                    return Ok((msg, others));
                 }
+                others.push(msg);
             }
             Ok(Some(_)) => {}
             Ok(None) => return Err("the phone closed the connection".into()),
@@ -722,8 +813,8 @@ impl Stats {
         }
     }
 
-    /// Returns the summary line once per second.
-    fn add(&mut self, h: &proto::Header, len: usize) -> Option<String> {
+    /// Returns the summary line and its figures once per second.
+    fn add(&mut self, h: &proto::Header, len: usize) -> Option<(String, crate::ui::Stats)> {
         self.bytes += len;
         if h.has(flags::CONFIG) {
             return None;
@@ -741,13 +832,16 @@ impl Stats {
         let elapsed = self.window.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();
+            let figures = crate::ui::Stats {
+                seconds: self.started.elapsed().as_secs_f64(),
+                fps: self.frames as f64 / secs,
+                mbits: self.bytes as f64 * 8.0 / secs / 1e6,
+                keyframes: self.keyframes,
+                gap_ms: self.max_gap_us as f64 / 1000.0,
+            };
             let line = format!(
                 "{:>4.0}s  {:5.1} fps  {:6.2} Mbit/s  keyframes {}  max frame gap {:4.0} ms",
-                self.started.elapsed().as_secs_f64(),
-                self.frames as f64 / secs,
-                self.bytes as f64 * 8.0 / secs / 1e6,
-                self.keyframes,
-                self.max_gap_us as f64 / 1000.0,
+                figures.seconds, figures.fps, figures.mbits, figures.keyframes, figures.gap_ms,
             );
             // Rewrite one line in a console; one line per second when redirected to a log.
             if io::stderr().is_terminal() {
@@ -761,7 +855,7 @@ impl Stats {
             self.keyframes = 0;
             self.bytes = 0;
             self.max_gap_us = 0;
-            return Some(line);
+            return Some((line, figures));
         }
         None
     }

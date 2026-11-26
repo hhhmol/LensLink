@@ -11,6 +11,8 @@ data class Controls(
     val zoom: Float? = null,
     /** Manual focus distance in diopters (1/m, 0 = infinity); null = continuous autofocus. */
     val focusDiopters: Float? = null,
+    /** Without a distance: stop autofocus where it is now. */
+    val focusHold: Boolean = false,
     /** Manual exposure time; with [iso], turns auto-exposure off. The missing one keeps its last auto value. */
     val exposureNs: Long? = null,
     val iso: Int? = null,
@@ -27,6 +29,7 @@ data class Controls(
         var c = this
         if (j.has("zoom")) c = c.copy(zoom = j.nullableDouble("zoom")?.toFloat())
         if (j.has("focus_diopters")) c = c.copy(focusDiopters = j.nullableDouble("focus_diopters")?.toFloat())
+        if (j.has("focus_hold")) c = c.copy(focusHold = j.optBoolean("focus_hold", false))
         if (j.has("exposure_ns")) c = c.copy(exposureNs = j.nullableDouble("exposure_ns")?.toLong())
         if (j.has("iso")) c = c.copy(iso = j.nullableDouble("iso")?.toInt())
         if (j.has("ev")) c = c.copy(ev = j.nullableDouble("ev")?.toFloat() ?: 0f)

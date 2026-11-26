@@ -42,7 +42,7 @@ Payload is a UTF-8 JSON object with a `type` field. Unknown types and fields are
 | `start` | PC → phone | `camera_id`, `width`, `height`, `fps`, `codec` (`h264`/`h265`), `bitrate` |
 | `stop` | PC → phone | — |
 | `set` | PC → phone | live camera settings, see below; kept across `start` |
-| `stats` | phone → PC | fps, bitrate, encoder queue, temperature, battery |
+| `status` | phone → PC | every 5 s: `battery` (percent), `charging`, `temperature` (battery, °C) |
 | `error` | both | `message` |
 | `stopped` | phone → PC | `reason`: `user` — streaming was stopped on the phone; the PC does not restart it until the phone is reconnected or the user starts it there |
 
@@ -55,6 +55,7 @@ without restarting it, and kept when a new `start` switches the mode.
 |---|---|
 | `zoom` | logical-camera zoom ratio; below 1 selects the ultrawide lens on multi-camera phones |
 | `focus_diopters` | manual focus distance (1/m, 0 = infinity); `null` = continuous autofocus |
+| `focus_hold` | `true`: without `focus_diopters`, stop autofocus where it last put the lens |
 | `exposure_ns`, `iso` | manual exposure; either one turns auto-exposure off, the other keeps its last auto value. Exposure is capped at one frame |
 | `ev` | exposure compensation in EV (rounded to the camera's step) |
 | `awb_kelvin` | white balance; the nearest preset (incandescent … shade) is used; `null` = auto |

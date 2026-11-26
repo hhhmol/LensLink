@@ -6,10 +6,14 @@
 //! size the video takes in the window, on the shared D3D11 device, and posts a message; the window
 //! draws it through its glass shader.
 
+mod atlas;
+mod curtain;
 mod glass;
 mod icon;
 mod overlay;
+mod panel;
 mod render;
+mod widgets;
 mod window;
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -23,6 +27,9 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+use lenslink_vcam::modes::Mode;
+use serde_json::Value;
 
 use crate::video::decoder::Frame;
 
@@ -53,6 +60,39 @@ pub(crate) struct Shared {
     state: Mutex<State>,
 }
 
+/// What the stream tells the window about the phone, for the widgets.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Info {
+    /// The phone's model.
+    pub phone: String,
+    /// What the phone streams now.
+    pub mode: Option<Mode>,
+    pub stats: Option<Stats>,
+    /// Charge in percent, and whether it is plugged in.
+    pub battery: Option<(u32, bool)>,
+    /// Battery temperature, °C.
+    pub temperature: Option<f32>,
+    /// The phone's ranges: zoom ratio, exposure compensation (EV), ISO.
+    pub zoom: Option<(f32, f32)>,
+    pub ev: Option<(f32, f32)>,
+    pub iso: Option<(f32, f32)>,
+    /// The modes the phone can stream, and the most its encoder takes, Mbit/s.
+    pub modes: Vec<Mode>,
+    pub max_mbits: Option<f32>,
+}
+
+/// The stream's figures for the last second.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stats {
+    /// Since the stream started.
+    pub seconds: f64,
+    pub fps: f64,
+    pub mbits: f64,
+    pub keyframes: u32,
+    /// Longest pause between two frames.
+    pub gap_ms: f64,
+}
+
 #[derive(Default)]
 pub(crate) struct State {
     pub status: String,
@@ -63,6 +103,12 @@ pub(crate) struct State {
     /// The size in pixels the video takes in the window now: frames are scaled to it.
     pub want: (u32, u32),
     pub last_frame: Option<Instant>,
+    pub info: Info,
+    /// The camera settings chosen in the window, as a `set` message for the phone, and a count of
+    /// changes so the stream sends each one once.
+    pub controls: (u64, Option<Value>),
+    /// The video chosen in the window: mode and bits per second.
+    pub chosen: Option<(Mode, u32)>,
 }
 
 impl Shared {
@@ -133,6 +179,33 @@ impl Link {
 
     pub fn set_picture(&mut self, picture: (u32, u32)) {
         self.picture = picture;
+    }
+
+    /// Changes what the widgets show; the window redraws if anything changed.
+    pub fn info(&self, change: impl FnOnce(&mut Info)) {
+        let mut st = self.shared.state();
+        let before = st.info.clone();
+        change(&mut st.info);
+        if st.info != before {
+            drop(st);
+            self.shared.post(window::WM_APP_STATUS);
+        }
+    }
+
+    /// The window's camera settings, if they changed since `sent` (0: send them anyway).
+    pub fn take_controls(&self, sent: &mut u64) -> Option<Value> {
+        let st = self.shared.state();
+        let (seq, msg) = &st.controls;
+        if *seq == *sent {
+            return None;
+        }
+        *sent = *seq;
+        msg.clone()
+    }
+
+    /// The video chosen in the window.
+    pub fn video(&self) -> Option<(Mode, u32)> {
+        self.shared.state().chosen
     }
 
     pub fn status(&self, text: &str) {

@@ -1,5 +1,6 @@
-//! Draws the window on a flip-model swap chain: the glass pass (video, floating elements, curtains)
-//! with Direct3D, then the elements' labels with Direct2D and DirectWrite on top.
+//! Draws the window on a flip-model swap chain: the glass pass (video, floating elements, curtains
+//! and their panels) with Direct3D, then the elements' labels with Direct2D and DirectWrite on top.
+//! The panels are drawn into their atlas with Direct2D only when they change.
 
 use std::cell::RefCell;
 
@@ -13,14 +14,19 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows_numerics::Vector2;
 
+use super::atlas::{Atlas, Group, Painter};
+use super::curtain::{Curtains, DEPTH_END, DEPTH_SIDE, POINTS, SIDES};
 use super::glass::{Constants, Glass, EDGE_POINTS, MAX_ELEMENTS};
+use super::panel::{self, Item, Key, Values};
 
 /// Colour around the video when the window's shape differs from the picture's.
 const BACKGROUND: [f32; 4] = [0.035, 0.04, 0.05, 1.0];
-/// How far outside the window a closed curtain's edge rests, in DIPs: further than the drops' reach.
-const CURTAIN_REST: f32 = 24.0;
+/// How far from a curtain's edge its panel still bends with it, in DIPs.
+const BEND: f32 = 130.0;
 
 pub enum Label<'a> {
+    /// Drawn apart (a widget's contents).
+    None,
     Glyph(&'a str),
     /// Wrapped at `wrap` DIPs.
     Text { text: &'a str, large: bool, wrap: f32 },
@@ -40,9 +46,19 @@ pub struct Frame<'a> {
     /// The video texture and the picture's size in it.
     pub video: Option<(&'a ID3D11Texture2D, (u32, u32))>,
     pub elements: &'a [Element<'a>],
+    pub curtains: &'a Curtains,
+    /// The settings: the look, and what the panels show.
+    pub values: &'a Values,
+    /// Each side's panel, laid out.
+    pub panels: &'a [Vec<Item>; 4],
+    /// The panels changed since the last frame.
+    pub panels_changed: bool,
+    /// The widgets' contents, over their glass.
+    pub widgets: &'a [Group<'a>],
 }
 
 pub struct Renderer {
+    device: ID3D11Device,
     swapchain: IDXGISwapChain2,
     waitable: HANDLE,
     glass: Glass,
@@ -55,8 +71,15 @@ pub struct Renderer {
     small: IDWriteTextFormat,
     large: IDWriteTextFormat,
     glyphs: IDWriteTextFormat,
+    section: IDWriteTextFormat,
+    strong: IDWriteTextFormat,
     brush: ID2D1SolidColorBrush,
     dpi: f32,
+    atlas: Option<Atlas>,
+    /// Draws the widgets' contents onto the window.
+    painter: Option<Painter>,
+    /// The atlas no longer shows the panels.
+    atlas_stale: bool,
     /// Recently used text layouts: the same labels are drawn on every frame.
     layouts: RefCell<Vec<(LayoutKey, IDWriteTextLayout, DWRITE_TEXT_METRICS)>>,
 }
@@ -68,8 +91,13 @@ struct LayoutKey {
     wrap: u32,
 }
 
-const LAYOUTS: usize = 16;
+/// Enough for every label and value on the panels.
+const LAYOUTS: usize = 160;
+const SMALL: u8 = 0;
+const LARGE: u8 = 1;
 const GLYPH: u8 = 2;
+const SECTION: u8 = 3;
+const STRONG: u8 = 4;
 
 const SWAP_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
@@ -113,8 +141,13 @@ impl Renderer {
             let glyphs = format(w!("Segoe Fluent Icons"), DWRITE_FONT_WEIGHT_NORMAL, 10.0)?;
             glyphs.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             glyphs.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let section = format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL, 10.5)?;
+            section.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let strong = format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.5)?;
+            strong.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let brush = dc.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 1.0), None)?;
             Ok(Renderer {
+                device: device.clone(),
                 swapchain,
                 waitable,
                 glass: Glass::new(device)?,
@@ -126,8 +159,13 @@ impl Renderer {
                 small,
                 large,
                 glyphs,
+                section,
+                strong,
                 brush,
                 dpi,
+                atlas: None,
+                painter: None,
+                atlas_stale: true,
                 layouts: RefCell::default(),
             })
         }
@@ -141,6 +179,7 @@ impl Renderer {
     pub fn set_dpi(&mut self, dpi: f32) {
         self.dpi = dpi;
         self.target = None;
+        self.atlas_stale = true;
         unsafe { self.dc.SetDpi(dpi, dpi) };
     }
 
@@ -149,6 +188,7 @@ impl Renderer {
         unsafe {
             self.target = None;
             self.view = None;
+            self.atlas_stale = true;
             self.dc.SetTarget(None::<&ID2D1Image>);
             self.swapchain.ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, SWAP_FLAGS)
         }
@@ -167,7 +207,21 @@ impl Renderer {
 
     /// Size of `text` as a label wrapped at `wrap`, in DIPs.
     pub fn measure(&self, text: &str, large: bool, wrap: f32) -> (f32, f32) {
-        self.layout(text, large as u8, wrap).map_or((0.0, 0.0), |(_, m)| (m.width, m.height))
+        self.layout(text, if large { LARGE } else { SMALL }, wrap).map_or((0.0, 0.0), |(_, m)| (m.width, m.height))
+    }
+
+    /// Size of `text` in a panel font, in DIPs.
+    pub fn measure_panel(&self, text: &str, font: panel::Font) -> (f32, f32) {
+        self.panel_layout(text, font).map_or((0.0, 0.0), |(_, m)| (m.width, m.height))
+    }
+
+    fn panel_layout(&self, text: &str, font: panel::Font) -> Option<(IDWriteTextLayout, DWRITE_TEXT_METRICS)> {
+        let format = match font {
+            panel::Font::Section => SECTION,
+            panel::Font::Text => SMALL,
+            panel::Font::Strong => STRONG,
+        };
+        self.layout(text, format, 1000.0)
     }
 
     /// A centred layout of `text` in a box `wrap` wide, and its metrics.
@@ -182,7 +236,9 @@ impl Renderer {
         }
         let f = match format {
             GLYPH => &self.glyphs,
-            1 => &self.large,
+            LARGE => &self.large,
+            SECTION => &self.section,
+            STRONG => &self.strong,
             _ => &self.small,
         };
         let utf16: Vec<u16> = text.encode_utf16().collect();
@@ -190,6 +246,11 @@ impl Renderer {
             let layout = self.dwrite.CreateTextLayout(&utf16, f, key.wrap as f32 / 4.0, 1000.0).ok()?;
             layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER).ok()?;
             layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR).ok()?;
+            if format == SECTION {
+                // Section titles are spaced capitals.
+                let range = DWRITE_TEXT_RANGE { startPosition: 0, length: utf16.len() as u32 };
+                layout.cast::<IDWriteTextLayout1>().ok()?.SetCharacterSpacing(0.0, 0.9, 0.0, range).ok()?;
+            }
             let mut m = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut m).ok()?;
             if cache.len() >= LAYOUTS {
@@ -227,11 +288,28 @@ impl Renderer {
             }
 
             let px = self.dpi / 96.0;
-            let mut c = Constants { size: [pw as f32, ph as f32], px, background: BACKGROUND, ..Default::default() };
-            // Closed curtains rest just outside the window, out of reach of the elements near its edges.
-            let rest = -CURTAIN_REST * px;
-            c.edges = [[rest; 4]; EDGE_POINTS];
-            c.edge_max = [rest; 4];
+            let v = frame.values;
+            let mut c = Constants {
+                size: [pw as f32, ph as f32],
+                px,
+                lens: v.get(Key::Lens),
+                dispersion: v.get(Key::Dispersion),
+                theme: if v.frost_theme() { 1.0 } else { 0.0 },
+                curtain_tint: v.get(Key::Tint),
+                background: BACKGROUND,
+                panel: [DEPTH_SIDE * px, DEPTH_END * px, BEND * px, v.get(Key::Frost)],
+                ..Default::default()
+            };
+            for side in SIDES {
+                let e = frame.curtains.edge(side);
+                let s = side.index();
+                // Two points beyond each end keep the spline flat there.
+                for (i, edge) in c.edges.iter_mut().enumerate().take(EDGE_POINTS) {
+                    edge[s] = e.x[i.saturating_sub(2).min(POINTS - 1)] * px;
+                }
+                c.edge_max[s] = e.max() * px;
+                c.edge_mean[s] = e.mean() * px;
+            }
             if let Some((_, picture)) = frame.video {
                 c.video = letterbox(picture, (pw, ph));
             }
@@ -244,8 +322,19 @@ impl Renderer {
                 c.count = (i + 1) as f32;
             }
 
+            let shows = frame.curtains.edges.iter().any(|e| e.shows());
+            self.atlas_stale |= frame.panels_changed;
             self.lock.Enter();
-            let result = self.draw_locked(frame, &c);
+            let result = (|| {
+                if shows {
+                    self.update_atlas(frame)?;
+                }
+                if let Some(a) = self.atlas.as_ref().filter(|_| shows) {
+                    c.atlas[0] = a.pixels.0 as f32;
+                    c.atlas[1] = a.pixels.1 as f32;
+                }
+                self.draw_locked(frame, &c, shows)
+            })();
             self.lock.Leave();
             if let Err(e) = &result {
                 if e.code() == D2DERR_RECREATE_TARGET {
@@ -258,10 +347,47 @@ impl Renderer {
         }
     }
 
-    unsafe fn draw_locked(&mut self, frame: &Frame, c: &Constants) -> Result<()> {
+    /// Redraws the panels into the atlas if they changed (or the window did).
+    unsafe fn update_atlas(&mut self, frame: &Frame) -> Result<()> {
+        unsafe {
+            let window = self.size();
+            if self.atlas.as_ref().is_none_or(|a| !a.fits(window, self.dpi)) {
+                self.atlas = Some(Atlas::new(&self.device, &self.dc, window, self.dpi)?);
+                self.atlas_stale = true;
+            }
+            if !self.atlas_stale {
+                return Ok(());
+            }
+            let atlas = self.atlas.as_ref().unwrap();
+            let layouts = |t: &str, f| self.panel_layout(t, f);
+            let r = atlas.draw(&self.dc, &self.brush, &layouts, frame.panels, frame.values);
+            // Back to the window.
+            if let Some(t) = &self.target {
+                self.dc.SetTarget(t);
+            }
+            r?;
+            self.atlas_stale = false;
+            Ok(())
+        }
+    }
+
+    unsafe fn draw_locked(&mut self, frame: &Frame, c: &Constants, shows: bool) -> Result<()> {
         unsafe {
             let view = self.view.clone().unwrap();
-            self.glass.draw(&view, frame.video.map(|v| v.0), c)?;
+            let atlas = self.atlas.as_ref().filter(|_| shows).map(|a| a.view.clone());
+            self.glass.draw(&view, frame.video.map(|v| v.0), atlas.as_ref(), c)?;
+
+            if !frame.widgets.is_empty() {
+                let pixels = self.pixels();
+                if self.painter.as_ref().is_none_or(|p| !p.fits(pixels, self.dpi)) {
+                    self.painter = Some(Painter::new(&self.dc, pixels, self.dpi)?);
+                }
+                let target: ID2D1Image = self.target.as_ref().unwrap().cast()?;
+                let layouts = |t: &str, f| self.panel_layout(t, f);
+                let r = self.painter.as_ref().unwrap().paint(&self.dc, &self.brush, &layouts, frame.widgets, frame.values, &target, false);
+                self.dc.SetTarget(&target);
+                r?;
+            }
 
             let dc = self.dc.clone();
             dc.BeginDraw();
@@ -270,8 +396,9 @@ impl Renderer {
                     continue;
                 }
                 let (text, format, wrap) = match e.label {
+                    Label::None => continue,
                     Label::Glyph(g) => (g, GLYPH, 100.0),
-                    Label::Text { text, large, wrap } => (text, large as u8, wrap),
+                    Label::Text { text, large, wrap } => (text, if large { LARGE } else { SMALL }, wrap),
                 };
                 let Some((layout, m)) = self.layout(text, format, wrap) else { continue };
                 // The layout is centred in its box: place the text's own middle on the element's.

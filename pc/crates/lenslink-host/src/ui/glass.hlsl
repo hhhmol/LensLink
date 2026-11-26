@@ -1,6 +1,8 @@
 // Liquid glass over the video: the window's floating elements and its four curtains are one signed
 // distance field. Inside it the picture is refracted by a thick lens rim (a drop's profile), split
 // into colours at the rim, and lit by two highlights. Elements that come close merge like drops.
+// The curtains are tinted and frosted, and their contents (an atlas, one panel per side, drawn at
+// rest) are looked up through the edge's bend pixel by pixel, so text curves with the wave.
 // All lengths are in pixels; PX is pixels per DIP.
 
 cbuffer Scene : register(b0)
@@ -15,6 +17,9 @@ cbuffer Scene : register(b0)
     float4 VR;     // video rectangle: x, y, w, h (w = 0: no video)
     float4 BG;     // colour around the video
     float4 EM;     // each curtain's deepest point: left, right, top, bottom
+    float4 MN;     // each curtain's mean depth: where its panel sits
+    float4 AT;     // panel depth (left/right), panel depth (top/bottom), bend falloff, frost 0..1
+    float4 UA;     // atlas size; frost texture size
     float4 B[12];  // elements: centre, half size
     float4 RC[12]; // corner radius, bevel cap
     float4 TC[12]; // tint: rgb, amount
@@ -22,7 +27,17 @@ cbuffer Scene : register(b0)
 };
 
 Texture2D<float4> Video : register(t0);
+Texture2D<float4> Atlas : register(t1);
+// The frost: a blurred quarter-size copy of the window (in the blur passes, their source).
+Texture2D<float4> Frost : register(t2);
 SamplerState Linear : register(s0);
+
+cbuffer Blur : register(b1)
+{
+    float2 DIR;    // one source texel along the blur
+    float SIGMA;   // in source texels
+    float BPAD;
+};
 
 float4 vs(uint id : SV_VertexID) : SV_Position
 {
@@ -39,6 +54,19 @@ float3 tex(float2 p)
     if (VR.z <= 0 || any(uv < 0) || any(uv > 1))
         return BG.rgb;
     return Video.SampleLevel(Linear, uv, 0).rgb;
+}
+
+float3 texb(float2 p)
+{
+    return Frost.SampleLevel(Linear, clamp(p / R, 0.003, 0.997), 0).rgb;
+}
+
+// A panel's pixel at atlas point q, if q is inside the panel's slot [lo, hi].
+float4 uiS(float2 q, float2 lo, float2 hi)
+{
+    if (any(q < lo) || any(q > hi))
+        return 0;
+    return Atlas.SampleLevel(Linear, q / UA.xy, 0);
 }
 
 float box(float2 p, float4 b, float r)
@@ -147,11 +175,29 @@ float4 ps(float4 pos : SV_Position) : SV_Target
     float c0, memR;
     float4 t0, e0;
     sdf(p + off * 0.6, c0, memR, t0, e0);
+    if (AT.w > 0)
+        c = lerp(c, texb(p + off), memR * min(1, AT.w * 4));
     float l = dot(c, float3(0.299, 0.587, 0.114));
     c = lerp(l, c, 1 + x * x * (0.4 + 0.7 * D));
     c = TH < 0.5 ? c * 0.8 : lerp(c, 1, 0.12);
     c = lerp(c, tint.rgb, tint.a * (1 - memR));
     c = lerp(c, TH < 0.5 ? float3(0.07, 0.08, 0.095) : float3(0.94, 0.955, 0.97), TI * memR);
+
+    // The curtains' print: each side shifts its panel along its depth by the edge's local
+    // displacement, fading away from the edge, so every pixel of text follows the wave.
+    float DW = AT.x, DH = AT.y, LAM = AT.z;
+    float4 v = float4(p.x, R.x - p.x, p.y, R.y - p.y);
+    float4 v0 = v - (ex - MN) * exp(-max(MN - v, 0) / LAM);
+    float4 ui = 0;
+    if (v.x < ex.x)
+        ui += uiS(float2(v0.x - MN.x + DW, p.y), float2(0, 0), float2(DW, R.y)) * (1 - ui.a);
+    if (v.y < ex.y)
+        ui += uiS(float2(MN.y - v0.y + DW, p.y), float2(DW, 0), float2(2 * DW, R.y)) * (1 - ui.a);
+    if (v.z < ex.z)
+        ui += uiS(float2(p.x, v0.z - MN.z + DH + R.y), float2(0, R.y), float2(R.x, R.y + DH)) * (1 - ui.a);
+    if (v.w < ex.w)
+        ui += uiS(float2(p.x, MN.w - v0.w + R.y + DH), float2(0, R.y + DH), float2(R.x, R.y + 2 * DH)) * (1 - ui.a);
+    c = c * (1 - ui.a) + ui.rgb;
 
     float3 n = normalize(float3(g * x, h));
     float3 L = normalize(float3(-0.55, -0.75, 0.65)), H = normalize(L + float3(0, 0, 1));
@@ -162,4 +208,29 @@ float4 ps(float4 pos : SV_Position) : SV_Target
     float rim = smoothstep(1.6 * PX, 0, abs(d + 1.1 * PX)) * (0.2 + 0.8 * abs(dot(g, normalize(float2(-0.6, -0.8)))));
     c += spec + fres + rim * 0.85;
     return float4(lerp(outside, c, smoothstep(PX, -PX, d)), 1);
+}
+
+// The frost, first pass: the window's picture at a quarter of its size (each pixel averages a block).
+float4 ps_down(float4 pos : SV_Position) : SV_Target
+{
+    float2 p = pos.xy * R / UA.zw;
+    float2 h = R / UA.zw * 0.25;
+    float3 c = tex(p + float2(-h.x, -h.y)) + tex(p + float2(h.x, -h.y)) + tex(p + float2(-h.x, h.y)) + tex(p + float2(h.x, h.y));
+    return float4(c * 0.25, 1);
+}
+
+// The frost, then: a Gaussian blur along DIR (run once across, once down).
+float4 ps_blur(float4 pos : SV_Position) : SV_Target
+{
+    float2 uv = pos.xy / UA.zw;
+    int r = min((int)ceil(SIGMA * 3), 32);
+    float3 c = 0;
+    float ws = 0;
+    [loop] for (int i = -r; i <= r; i++)
+    {
+        float w = exp(-0.5 * i * i / max(SIGMA * SIGMA, 1e-4));
+        c += Frost.SampleLevel(Linear, uv + DIR * i, 0).rgb * w;
+        ws += w;
+    }
+    return float4(c / ws, 1);
 }

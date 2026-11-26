@@ -14,6 +14,8 @@ fn main() {
     let text = std::fs::read(source).unwrap();
     compile(&text, s!("vs"), s!("vs_5_0"), &out.join("glass_vs.cso"));
     compile(&text, s!("ps"), s!("ps_5_0"), &out.join("glass_ps.cso"));
+    compile(&text, s!("ps_down"), s!("ps_5_0"), &out.join("glass_down.cso"));
+    compile(&text, s!("ps_blur"), s!("ps_5_0"), &out.join("glass_blur.cso"));
 }
 
 fn compile(text: &[u8], entry: PCSTR, target: PCSTR, to: &std::path::Path) {

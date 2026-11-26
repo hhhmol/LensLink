@@ -80,6 +80,20 @@ pub fn closest(offered: &[Mode], want: Mode) -> Mode {
         .unwrap_or(want)
 }
 
+/// The most the phone's hardware encoder for `codec` takes, bits per second.
+pub fn max_bitrate(caps: &Value, codec: Codec) -> Option<u32> {
+    let mime = match codec {
+        Codec::H264 => "video/avc",
+        Codec::H265 => "video/hevc",
+    };
+    caps["encoders"]
+        .as_array()?
+        .iter()
+        .find(|e| e["hardware"].as_bool() == Some(true) && e["mime"].as_str() == Some(mime))?["bitrateRangeBps"][1]
+        .as_u64()
+        .map(|b| b.min(u32::MAX as u64) as u32)
+}
+
 pub fn bitrate(m: Mode) -> u32 {
     let bps = m.width as f64 * m.height as f64 * m.fps as f64 * 0.32;
     bps.clamp(2e6, 60e6) as u32
