@@ -66,6 +66,20 @@ pub fn from_capabilities(caps: &Value, camera: &str, codec: Codec) -> Result<Vec
 }
 
 /// Bitrate for a mode: about 0.32 bit per pixel (20 Mbit/s at 1080p30), 2–60 Mbit/s.
+/// The offered mode closest to `want`: the same one when offered, otherwise the nearest picture
+/// size that is not smaller (scaling down looks better than up), then frame rate. `want` itself when
+/// nothing is offered (no capability report).
+pub fn closest(offered: &[Mode], want: Mode) -> Mode {
+    let area = |m: &Mode| (m.width * m.height) as i64;
+    offered
+        .iter()
+        .copied()
+        .min_by_key(|m| {
+            (area(m) < area(&want), (area(m) - area(&want)).abs(), (m.fps as i64 - want.fps as i64).abs())
+        })
+        .unwrap_or(want)
+}
+
 pub fn bitrate(m: Mode) -> u32 {
     let bps = m.width as f64 * m.height as f64 * m.fps as f64 * 0.32;
     bps.clamp(2e6, 60e6) as u32
@@ -89,6 +103,18 @@ fn bucket(height: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn closest_mode() {
+        use super::closest;
+        use lenslink_vcam::modes::Mode;
+        let m = |width, height, fps| Mode { width, height, fps };
+        let offered = [m(1920, 1080, 30), m(1280, 720, 30), m(3840, 2160, 30)];
+        assert_eq!(closest(&offered, m(1280, 720, 30)), m(1280, 720, 30));
+        assert_eq!(closest(&offered, m(1600, 900, 30)), m(1920, 1080, 30));
+        assert_eq!(closest(&offered, m(1280, 720, 60)), m(1280, 720, 30));
+        assert_eq!(closest(&[], m(640, 480, 30)), m(640, 480, 30));
+    }
+
     use super::*;
     use serde_json::json;
 

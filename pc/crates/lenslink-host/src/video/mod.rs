@@ -114,20 +114,34 @@ impl Viewer {
         self.camera.as_mut()?.take_controls(descs)
     }
 
-    /// The phone is switching to `mode`: a fresh decoder for the new stream, new output sizes.
-    pub fn set_mode(&mut self, mode: Mode) -> Result<(), String> {
+    /// The phone starts a new stream in `mode`: a fresh decoder, new picture size.
+    pub fn set_stream(&mut self, mode: Mode) -> Result<(), String> {
         self.decoder = Decoder::new(&self.device, self.codec, mode.width, mode.height, mode.fps)
             .map_err(|e| format!("decoder: {e}"))?;
         self.mode = mode;
         let picture = (mode.width, mode.height);
         if let Some(c) = self.camera.as_mut() {
-            c.set_mode(picture, mode);
+            c.set_picture(picture);
         }
         if let Some(p) = self.preview.as_mut() {
             p.set_picture(picture);
             p.set_title(&title(self.codec, mode));
         }
         Ok(())
+    }
+
+    /// Size and rate the virtual camera publishes (the mode an app selected).
+    pub fn set_output(&mut self, mode: Mode) {
+        if let Some(c) = self.camera.as_mut() {
+            c.set_output(mode);
+        }
+    }
+
+    /// Makes the next `take_controls` report the values apps set, for a freshly connected phone.
+    pub fn resend_controls(&mut self) {
+        if let Some(c) = self.camera.as_mut() {
+            c.resend_controls();
+        }
     }
 
     pub fn packet(&mut self, data: &[u8], pts_us: u64, config: bool, keyframe: bool) -> Result<(), String> {

@@ -23,6 +23,16 @@
             </intent-filter>
         </activity>
 
+        <!-- Started by the PC over adb; DUMP keeps other apps out (see AutostartActivity). -->
+        <activity
+            android:name=".AutostartActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <service
             android:name=".stream.StreamService"
             android:exported="false"

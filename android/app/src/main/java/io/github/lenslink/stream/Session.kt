@@ -59,6 +59,11 @@ class Session(private val context: Context, private val socket: LocalSocket) {
         }
     }
 
+    /** The user stopped streaming on the phone. */
+    fun stoppedByUser() {
+        writer.control(JSONObject().put("type", "stopped").put("reason", "user"))
+    }
+
     private fun onStreamFailed(e: Throwable) {
         runCatching { writer.control(JSONObject().put("type", "error").put("message", e.message ?: e.toString())) }
             .onFailure {

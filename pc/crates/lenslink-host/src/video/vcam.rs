@@ -116,10 +116,19 @@ impl VirtualCamera {
         }).collect())
     }
 
-    /// The phone now streams `picture`-sized frames; publish `output`-sized ones.
-    pub fn set_mode(&mut self, picture: (u32, u32), output: Mode) {
+    /// The phone now streams `picture`-sized frames.
+    pub fn set_picture(&mut self, picture: (u32, u32)) {
         self.picture = picture;
+    }
+
+    /// Publish `output`-sized frames.
+    pub fn set_output(&mut self, output: Mode) {
         self.output = output;
+    }
+
+    /// The next `take_controls` fires if any app changed a control since the camera was created.
+    pub fn resend_controls(&mut self) {
+        self.last_controls_seq = 0;
     }
 
     pub fn push(&mut self, frame: &Frame) -> windows::core::Result<()> {

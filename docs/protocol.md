@@ -44,6 +44,7 @@ Payload is a UTF-8 JSON object with a `type` field. Unknown types and fields are
 | `set` | PC → phone | live camera settings, see below; kept across `start` |
 | `stats` | phone → PC | fps, bitrate, encoder queue, temperature, battery |
 | `error` | both | `message` |
+| `stopped` | phone → PC | `reason`: `user` — streaming was stopped on the phone; the PC does not restart it until the phone is reconnected or the user starts it there |
 
 ### `set`
 

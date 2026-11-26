@@ -156,48 +156,366 @@ fn parse_bitrate(s: &str) -> Result<u32, String> {
     Ok((n * mult) as u32)
 }
 
+/// Component that starts the phone's streaming service without user interaction (see
+/// `AutostartActivity` in the Android app).
+const AUTOSTART: &str = "io.github.lenslink/.AutostartActivity";
+/// How often the phone app may be launched while it does not come up (locked phone, before first
+/// unlock after a reboot).
+const LAUNCH_INTERVAL: Duration = Duration::from_secs(10);
+const STOPPED: &str = "streaming was stopped on the phone: tap \"Start streaming service\" in LensLink \
+                       to continue";
+/// A started stream that delivers nothing for this long is treated as lost.
+const STALL: Duration = Duration::from_secs(5);
+
+/// Streams until the user quits, reconnecting whenever the phone goes away: cable pulled, phone
+/// rebooted, app stopped. The window and the virtual camera stay up meanwhile.
 pub fn run(o: &Options) -> Result<(), String> {
-    let serial = o.serial.as_deref();
-    let local = format!("tcp:{}", o.port);
-    let remote = format!("localabstract:{}", proto::SOCKET_NAME);
-    adb::check(serial, &["forward", &local, &remote])?;
-    let result = stream(o);
-    let _ = adb::run(serial, &["forward", "--remove", &local]);
-    result
+    let file = match &o.out {
+        Some(path) => Some(
+            std::fs::File::create(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    let mode = Mode { width: o.width, height: o.height, fps: o.fps };
+    let viewer = if o.player == Player::Window || o.virtual_camera {
+        video::init()?;
+        let outputs = video::Outputs { window: o.player == Player::Window, virtual_camera: o.virtual_camera };
+        Some(Viewer::new(o.codec, mode, outputs)?)
+    } else {
+        None
+    };
+    let mut host = Host {
+        o,
+        viewer,
+        file,
+        output: mode,
+        app_selected: false,
+        offered: Vec::new(),
+        last_launch: None,
+        user_stopped: false,
+        said: String::new(),
+    };
+    loop {
+        let Some(serial) = host.wait_for_phone()? else { return Ok(()) };
+        match host.connect(&serial) {
+            Ok(End::Quit) => return Ok(()),
+            Ok(End::Lost(why, retry)) | Err(Fail::Retry(why, retry)) => {
+                host.say(&why);
+                if !host.idle(retry) {
+                    return Ok(());
+                }
+            }
+            Err(Fail::Fatal(e)) => return Err(e),
+        }
+    }
 }
 
-fn stream(o: &Options) -> Result<(), String> {
-    let sock = TcpStream::connect(("127.0.0.1", o.port)).map_err(|e| format!("connect: {e}"))?;
-    sock.set_nodelay(true).ok();
-    let mut writer = sock.try_clone().map_err(|e| e.to_string())?;
-    let mut reader = BufReader::with_capacity(1 << 20, sock);
+/// How one connection ended.
+enum End {
+    /// The user closed the window.
+    Quit,
+    /// Try again after the delay.
+    Lost(String, Duration),
+}
 
-    proto::write_handshake(&mut writer).map_err(|e| e.to_string())?;
-    match proto::read_handshake(&mut reader) {
-        Ok(_) => {}
-        Err(ProtocolError::Io(e)) if is_closed(&e) => {
-            return Err("the phone did not answer. Open LensLink on the phone and tap \
-                        \"Start streaming service\"."
-                .into())
+enum Fail {
+    Retry(String, Duration),
+    /// A problem on this PC that retrying will not fix.
+    Fatal(String),
+}
+
+/// Connection problems are worth retrying.
+impl From<String> for Fail {
+    fn from(e: String) -> Self {
+        Fail::Retry(e, Duration::from_secs(1))
+    }
+}
+
+/// State that outlives one connection.
+struct Host<'a> {
+    o: &'a Options,
+    viewer: Option<Viewer>,
+    file: Option<std::fs::File>,
+    /// What the virtual camera publishes: the mode an app selected. The phone streams the closest
+    /// mode it offers.
+    output: Mode,
+    app_selected: bool,
+    /// Modes of the connected phone, as last written for the virtual camera.
+    offered: Vec<Mode>,
+    last_launch: Option<Instant>,
+    /// The user stopped streaming on the phone: do not start it again until the phone is reconnected
+    /// or the user starts it there.
+    user_stopped: bool,
+    said: String,
+}
+
+impl Host<'_> {
+    /// Status line, printed once per change.
+    fn say(&mut self, text: &str) {
+        if self.said != text {
+            eprintln!("{text}");
+            self.said = text.to_string();
         }
-        Err(e) => return Err(e.to_string()),
+        if let Some(v) = &self.viewer {
+            v.status(text);
+        }
     }
 
-    let mut mode = Mode { width: o.width, height: o.height, fps: o.fps };
-    let mut camera_controls = Vec::new();
-    if o.virtual_camera {
-        // The camera offers apps the modes this phone camera supports.
-        send_control(&mut writer, &json!({ "type": "get_capabilities" }))?;
-        let caps = wait_for_capabilities(&mut reader)?;
-        let offered = modes::from_capabilities(&caps, &o.camera, o.codec)?;
-        if !offered.contains(&mode) {
-            let fallback = if offered.contains(&Mode::DEFAULT) { Mode::DEFAULT } else { offered[0] };
-            eprintln!("camera {} has no {mode} mode; starting with {fallback}", o.camera);
-            mode = fallback;
+    /// Keeps the window responsive for `d`. False once the user closed it.
+    fn idle(&mut self, d: Duration) -> bool {
+        let until = Instant::now() + d;
+        while Instant::now() < until {
+            if let Some(v) = self.viewer.as_mut() {
+                if !v.pump() {
+                    return false;
+                }
+                if let Some(r) = v.take_request() {
+                    self.select(r);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
         }
-        // The first line is the camera's default mode.
-        let mut list = vec![mode];
-        list.extend(offered.iter().copied().filter(|m| *m != mode));
+        true
+    }
+
+    /// An app selected `r` on the virtual camera.
+    fn select(&mut self, r: Mode) {
+        eprintln!("an app selected {r}");
+        self.output = r;
+        self.app_selected = true;
+        if let Some(v) = self.viewer.as_mut() {
+            v.set_output(r);
+        }
+    }
+
+    /// Serial of a phone ready for adb; None once the user closed the window.
+    fn wait_for_phone(&mut self) -> Result<Option<String>, String> {
+        loop {
+            let devices = adb::devices()?;
+            let wanted = |s: &str| self.o.serial.as_deref().is_none_or(|w| w == s);
+            let mine: Vec<_> = devices.iter().filter(|(s, _)| wanted(s)).collect();
+            if let Some((serial, _)) = mine.iter().find(|(_, state)| state == "device") {
+                return Ok(Some(serial.clone()));
+            }
+            // A new connection is a fresh start.
+            self.user_stopped = false;
+            let text = if mine.iter().any(|(_, state)| state == "unauthorized") {
+                "the phone asks to allow USB debugging: confirm on its screen"
+            } else {
+                "waiting for the phone: connect it with USB (USB debugging on)"
+            };
+            self.say(text);
+            if !self.idle(Duration::from_secs(1)) {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn connect(&mut self, serial: &str) -> Result<End, Fail> {
+        let local = format!("tcp:{}", self.o.port);
+        let remote = format!("localabstract:{}", proto::SOCKET_NAME);
+        adb::check(Some(serial), &["forward", &local, &remote])?;
+        let result = self.session(serial);
+        let _ = adb::run(Some(serial), &["forward", "--remove", &local]);
+        result
+    }
+
+    fn session(&mut self, serial: &str) -> Result<End, Fail> {
+        let o = self.o;
+        let sock = TcpStream::connect(("127.0.0.1", o.port)).map_err(|e| format!("connect: {e}"))?;
+        sock.set_nodelay(true).ok();
+        let mut writer = sock.try_clone().map_err(|e| e.to_string())?;
+        let mut reader = BufReader::with_capacity(1 << 20, sock);
+
+        proto::write_handshake(&mut writer).map_err(|e| e.to_string())?;
+        match proto::read_handshake(&mut reader) {
+            Ok(_) => {}
+            // adb accepted the connection but nothing listens on the phone.
+            Err(ProtocolError::Io(e)) if is_closed(&e) => return Ok(self.launch_app(serial)),
+            Err(e) => return Err(e.to_string().into()),
+        }
+        self.last_launch = None;
+        self.user_stopped = false;
+        self.say("phone connected");
+
+        let mut phone_mode = self.output;
+        if o.virtual_camera {
+            send_control(&mut writer, &json!({ "type": "get_capabilities" }))?;
+            let caps = wait_for_capabilities(&mut reader)?;
+            let offered = modes::from_capabilities(&caps, &o.camera, o.codec)
+                .map_err(|e| Fail::Retry(e, Duration::from_secs(5)))?;
+            self.camera_modes(offered).map_err(Fail::Fatal)?;
+            phone_mode = modes::closest(&self.offered, self.output);
+            let descs = controls::from_capabilities(&caps, &o.camera);
+            lenslink_vcam::controls::write(&descs)
+                .map_err(|e| Fail::Fatal(format!("cannot write {} ({e})", lenslink_vcam::controls::CONTROLS_PATH)))?;
+            eprintln!("camera controls: {}", descs.iter().map(|d| d.control.name()).collect::<Vec<_>>().join(", "));
+            if let Some(v) = self.viewer.as_mut() {
+                v.set_controls(descs);
+            }
+        }
+        send_control(&mut writer, &start_message(o, phone_mode))?;
+        if let Some(v) = self.viewer.as_mut() {
+            v.set_stream(phone_mode).map_err(Fail::Fatal)?;
+            v.set_output(self.output);
+            // The phone starts with automatic settings; restore what apps set.
+            v.resend_controls();
+        }
+        let title = format!("LensLink {phone_mode} {}", o.codec.wire_name());
+        let mut ffplay = if o.player == Player::Ffplay { Some(spawn_ffplay(o, &title).map_err(Fail::Fatal)?) } else { None };
+
+        // The socket is read on its own thread so the window keeps responding while no frame arrives.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || loop {
+            let r = proto::read_packet(&mut reader);
+            let last = !matches!(r, Ok(Some(_)));
+            if tx.send(r).is_err() || last {
+                break;
+            }
+        });
+        let result = (|| -> Result<End, Fail> {
+            let mut stats = Stats::new();
+            let mut last_video = Instant::now();
+            loop {
+                if let Some(v) = self.viewer.as_mut() {
+                    if !v.pump() {
+                        return Ok(End::Quit);
+                    }
+                }
+                if let Some(r) = self.viewer.as_mut().and_then(Viewer::take_request) {
+                    self.select(r);
+                    let p = modes::closest(&self.offered, r);
+                    if p != phone_mode {
+                        phone_mode = p;
+                        send_control(&mut writer, &start_message(o, phone_mode))?;
+                        let v = self.viewer.as_mut().unwrap();
+                        v.set_stream(phone_mode).map_err(|e| Fail::Fatal(format!("switching to {p}: {e}")))?;
+                        last_video = Instant::now();
+                    }
+                }
+                if let Some(values) = self.viewer.as_mut().and_then(Viewer::take_controls) {
+                    let msg = controls::to_phone(&values);
+                    eprintln!("controls: {msg}");
+                    send_control(&mut writer, &msg)?;
+                }
+                let packet = match rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(Ok(Some(p))) => p,
+                    Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
+                        return Ok(End::Lost("the phone disconnected".into(), Duration::from_secs(1)))
+                    }
+                    Ok(Err(e)) => return Ok(End::Lost(format!("connection: {e}"), Duration::from_secs(1))),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if last_video.elapsed() > STALL {
+                            return Ok(End::Lost("no video from the phone for 5 s".into(), Duration::from_secs(1)));
+                        }
+                        continue;
+                    }
+                };
+                match packet.header.kind {
+                    Kind::Control => {
+                        let msg = control_message(&packet.payload)
+                            .map_err(|e| Fail::Retry(e, Duration::from_secs(3)))?;
+                        if msg["type"] == "stopped" {
+                            self.user_stopped = true;
+                            return Ok(End::Lost(STOPPED.into(), Duration::from_secs(2)));
+                        }
+                    }
+                    Kind::Video => {
+                        last_video = Instant::now();
+                        let h = &packet.header;
+                        if let Some(f) = self.file.as_mut() {
+                            f.write_all(&packet.payload).map_err(|e| Fail::Fatal(format!("write file: {e}")))?;
+                        }
+                        if let Some(p) = ffplay.as_mut() {
+                            let stdin = p.stdin.as_mut().expect("ffplay stdin is piped");
+                            if stdin.write_all(&packet.payload).is_err() {
+                                eprintln!("\nplayer window closed");
+                                return Ok(End::Quit);
+                            }
+                        }
+                        if let Some(v) = self.viewer.as_mut() {
+                            v.packet(&packet.payload, h.pts_us, h.has(flags::CONFIG), h.has(flags::KEYFRAME))?;
+                        }
+                        if let Some(line) = stats.add(h, packet.payload.len()) {
+                            if let Some(v) = self.viewer.as_ref() {
+                                v.status(&line);
+                            }
+                        }
+                    }
+                    Kind::Audio | Kind::Unknown(_) => {}
+                }
+            }
+        })();
+        // Unblocks the reader thread.
+        let _ = writer.shutdown(std::net::Shutdown::Both);
+        if let Some(mut p) = ffplay {
+            let _ = p.kill();
+        }
+        if io::stderr().is_terminal() {
+            eprintln!();
+        }
+        self.said.clear();
+        result
+    }
+
+    /// Nothing answers on the phone: start the LensLink service there.
+    fn launch_app(&mut self, serial: &str) -> End {
+        let retry = Duration::from_millis(1500);
+        if self.user_stopped {
+            // Only probe whether the user started it again.
+            return End::Lost(STOPPED.into(), Duration::from_secs(2));
+        }
+        if self.last_launch.is_some_and(|t| t.elapsed() < LAUNCH_INTERVAL) {
+            return End::Lost(
+                "the LensLink app on the phone does not answer: unlock the phone, or open LensLink and \
+                 tap \"Start streaming service\""
+                    .into(),
+                retry,
+            );
+        }
+        self.last_launch = Some(Instant::now());
+        match adb::run(Some(serial), &["shell", "am", "start", "-n", AUTOSTART]) {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+                if text.contains("does not exist") {
+                    let installed = adb::run(Some(serial), &["shell", "pm", "path", crate::APP_ID])
+                        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("package:"));
+                    let why = if installed {
+                        "the LensLink app on the phone is too old to start by itself: update it, or tap \
+                         \"Start streaming service\" in it"
+                    } else {
+                        "the LensLink app is not installed on the phone"
+                    };
+                    End::Lost(why.into(), Duration::from_secs(5))
+                } else if text.contains("Error") {
+                    End::Lost(format!("cannot start the LensLink app: {}", text.trim()), Duration::from_secs(5))
+                } else {
+                    End::Lost("starting the LensLink app on the phone".into(), retry)
+                }
+            }
+            Err(e) => End::Lost(e, retry),
+        }
+    }
+
+    /// Writes the phone's modes for the virtual camera when they changed (first connection, other
+    /// phone). The first line is the camera's default mode.
+    fn camera_modes(&mut self, offered: Vec<Mode>) -> Result<(), String> {
+        if offered == self.offered {
+            return Ok(());
+        }
+        let wanted = Mode { width: self.o.width, height: self.o.height, fps: self.o.fps };
+        let default = if offered.contains(&wanted) {
+            wanted
+        } else if offered.contains(&Mode::DEFAULT) {
+            Mode::DEFAULT
+        } else {
+            offered[0]
+        };
+        if !self.app_selected {
+            self.output = default;
+        }
+        let mut list = vec![default];
+        list.extend(offered.iter().copied().filter(|m| *m != default));
         lenslink_vcam::modes::write(&list).map_err(|e| {
             format!(
                 "cannot write {} ({e}). Reinstall the virtual camera: tools/install-vcam.ps1",
@@ -205,106 +523,9 @@ fn stream(o: &Options) -> Result<(), String> {
             )
         })?;
         eprintln!("camera modes: {}", list.iter().map(Mode::to_string).collect::<Vec<_>>().join(", "));
-        camera_controls = controls::from_capabilities(&caps, &o.camera);
-        lenslink_vcam::controls::write(&camera_controls)
-            .map_err(|e| format!("cannot write {} ({e})", lenslink_vcam::controls::CONTROLS_PATH))?;
-        eprintln!(
-            "camera controls: {}",
-            camera_controls.iter().map(|d| d.control.name()).collect::<Vec<_>>().join(", ")
-        );
+        self.offered = offered;
+        Ok(())
     }
-    send_control(&mut writer, &start_message(o, mode))?;
-
-    let mut file = match &o.out {
-        Some(path) => Some(
-            std::fs::File::create(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?,
-        ),
-        None => None,
-    };
-    let title = format!("LensLink {mode} {}", o.codec.wire_name());
-    let mut ffplay = if o.player == Player::Ffplay { Some(spawn_ffplay(o, &title)?) } else { None };
-    let mut viewer = if o.player == Player::Window || o.virtual_camera {
-        video::init()?;
-        let outputs = video::Outputs { window: o.player == Player::Window, virtual_camera: o.virtual_camera };
-        let mut v = Viewer::new(o.codec, mode, outputs)?;
-        v.set_controls(camera_controls);
-        Some(v)
-    } else {
-        None
-    };
-
-    // The socket is read on its own thread so the window keeps responding while no frame arrives.
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || loop {
-        let r = proto::read_packet(&mut reader);
-        let last = !matches!(r, Ok(Some(_)));
-        if tx.send(r).is_err() || last {
-            break;
-        }
-    });
-    let result = (|| {
-        let mut stats = Stats::new();
-        loop {
-            if let Some(v) = viewer.as_mut() {
-                if !v.pump() {
-                    eprintln!("
-window closed");
-                    return Ok(());
-                }
-                if let Some(requested) = v.take_request().filter(|r| *r != mode) {
-                    eprintln!("
-an app selected {requested}: switching the phone");
-                    mode = requested;
-                    send_control(&mut writer, &start_message(o, mode))?;
-                    v.set_mode(mode).map_err(|e| format!("switching to {mode}: {e}"))?;
-                }
-                if let Some(values) = v.take_controls() {
-                    let msg = controls::to_phone(&values);
-                    eprintln!("\ncontrols from an app: {msg}");
-                    send_control(&mut writer, &msg)?;
-                }
-            }
-            let packet = match rx.recv_timeout(Duration::from_millis(5)) {
-                Ok(Ok(Some(p))) => p,
-                Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
-                    return Err("the phone closed the connection".to_string())
-                }
-                Ok(Err(e)) => return Err(e.to_string()),
-                Err(RecvTimeoutError::Timeout) => continue,
-            };
-            match packet.header.kind {
-                Kind::Control => {
-                    control_message(&packet.payload)?;
-                }
-                Kind::Video => {
-                    let h = &packet.header;
-                    if let Some(f) = file.as_mut() {
-                        f.write_all(&packet.payload).map_err(|e| format!("write file: {e}"))?;
-                    }
-                    if let Some(p) = ffplay.as_mut() {
-                        let stdin = p.stdin.as_mut().expect("ffplay stdin is piped");
-                        if stdin.write_all(&packet.payload).is_err() {
-                            eprintln!("
-player window closed");
-                            return Ok(());
-                        }
-                    }
-                    if let Some(v) = viewer.as_mut() {
-                        v.packet(&packet.payload, h.pts_us, h.has(flags::CONFIG), h.has(flags::KEYFRAME))?;
-                    }
-                    if let Some(line) = stats.add(h, packet.payload.len()) {
-                        if let Some(v) = viewer.as_ref() {
-                            v.status(&line);
-                        }
-                    }
-                }
-                Kind::Audio | Kind::Unknown(_) => {}
-            }
-        }
-    })();
-    // Unblocks the reader thread.
-    let _ = writer.shutdown(std::net::Shutdown::Both);
-    result
 }
 
 fn start_message(o: &Options, mode: Mode) -> Value {
@@ -343,7 +564,7 @@ fn control_message(payload: &[u8]) -> Result<Value, String> {
             msg["model"].as_str().unwrap_or("?"),
             msg["android"].as_str().unwrap_or("?")
         ),
-        Some("capabilities") => {}
+        Some("capabilities" | "stopped") => {}
         _ => eprintln!("phone: {text}"),
     }
     Ok(msg)

@@ -18,16 +18,19 @@ video / [audio] / control  ◄───────────────  cam
 
 ## Status
 
-Pre-alpha, step 4 of the [roadmap](docs/architecture.md#roadmap) done. Working now:
+Pre-alpha, steps 1–5 of the [roadmap](docs/architecture.md#roadmap) done, step 7 (polish) under way. Working now:
 
 - a **camera probe** that reports what Camera2 and the hardware encoders of a phone can really do;
 - **streaming** the phone camera over USB into a LensLink window on the PC, decoded on the GPU
   (≈ 200 ms glass-to-glass at 1080p30 on a Redmi Note 8T);
 - a **Windows 11 virtual camera** "LensLink" that any app can pick (Camera, Teams, Zoom, browsers).
   It offers every webcam mode the phone camera supports (e.g. 4K30, 1080p60, 720p30); picking one in
-  an app switches the phone to it.
+  an app switches the phone to it. The phone's zoom, focus, exposure, ISO and white balance appear
+  as standard camera properties;
+- **automatic reconnection**: pull the cable, reboot the phone or stop the app, and streaming resumes
+  by itself once the phone is back. The window and the virtual camera stay up meanwhile.
 
-Not yet: camera controls from the PC, filters, a tray app, an installer.
+Not yet: filters, a tray app, an installer.
 
 ## Layout
 
@@ -66,7 +69,7 @@ Alternative: copy `android/app/build/outputs/apk/debug/app-debug.apk` to the pho
 
 ## Streaming
 
-On the phone: open LensLink and tap **Start streaming service**. On the PC:
+On the phone: install LensLink and open it once to grant camera access. On the PC:
 
 ```powershell
 cd pc
@@ -76,6 +79,12 @@ cargo run --release -p lenslink-host -- stream
 A window shows the camera; Esc closes it. Useful options: `--size 3840x2160`, `--fps 60`,
 `--codec h265` (needs *HEVC Video Extensions* from the Microsoft Store), `--zoom 0.6`,
 `--out file.h264`, `--ffplay` (play in FFmpeg's ffplay instead). `lenslink-host` without arguments lists all options.
+
+The host waits for the phone and starts LensLink's streaming service on it over adb (also on the lock
+screen), so after the first setup nothing needs to be touched on the phone. When the connection drops
+it reconnects and restores the mode and the camera settings apps had chosen. Tapping **Stop** on the
+phone (app or notification) is respected: the PC leaves streaming off until **Start** is tapped there
+or the cable is plugged in again.
 
 ## Virtual camera
 

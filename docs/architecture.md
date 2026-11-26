@@ -72,8 +72,10 @@ playing the stream into a user-installed virtual cable.
 3. **Rust host** — protocol, GPU decode (Media Foundation + DXVA), preview window (D3D11 video processor). ✓
 4. **Virtual camera** — Media Foundation media source + `MFCreateVirtualCamera`. ✓
 5. **Controls** — a) video modes from the phone, chosen by apps ✓; b) lens/zoom, focus, exposure, ISO, WB as standard camera properties ✓
-6. **Filters** — shader filters, then segmentation, then interpolation. ← next
-7. **Polish** — auto-reconnect, autostart, installer, battery/thermal guards on the phone.
+6. **Filters** — shader filters, then segmentation, then interpolation.
+7. **Polish** ← now — a) auto-reconnect and autostart of the phone service ✓; b) stream only while an
+   app uses the camera, adb device events instead of polling; c) tray app with a settings window;
+   d) installer; e) battery/thermal guards on the phone.
 
 ## Virtual camera internals (step 4)
 
@@ -102,3 +104,21 @@ playing the stream into a user-installed virtual cable.
 - The stream answers each `RequestSample` with the newest host frame as soon as one arrives, so the
   camera adds no fixed delay. Without host frames for 1 s it sends a dark grey placeholder at 30 fps.
 - The camera log is `C:\ProgramData\LensLink\logs\vcam.log`.
+
+## Reconnection (step 7a)
+
+The host keeps the window, the virtual camera and the output file across connections and loops:
+wait for an adb device in state `device` (reporting `unauthorized` to the user) → `adb forward` →
+handshake → stream until the socket closes or no video arrives for 5 s → retry.
+
+- When adb connects but nothing listens on the phone, the host runs
+  `am start -n io.github.lenslink/.AutostartActivity`: an invisible activity that shows over the lock
+  screen, starts the camera foreground service (Android 14+ only allows that from the foreground) and
+  closes. It is exported but requires `android.permission.DUMP`, which adb's shell holds and apps
+  cannot get. Launches are spaced 10 s apart; `pm path` tells "not installed" from "too old".
+- Stop on the phone sets a persisted flag and sends `stopped` to the PC; the autostart activity then
+  does nothing and the PC only probes the socket. Start in the app or in the "stopped" notification,
+  or a new USB connection, clears it.
+- On reconnect the phone gets the mode the camera currently publishes (or the closest one it offers,
+  preferring larger sizes, scaled on the GPU) and the control values apps set, which the phone
+  forgets between sessions.
