@@ -1,23 +1,40 @@
 //! Thin wrapper over the `adb` command-line tool.
 
 use std::io::Read;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-/// `adb` from `ANDROID_HOME` when present, otherwise whatever is on PATH.
+/// adb is a console program: without this it would flash a console window when the tray app (which
+/// has no console) runs it.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `adb.exe` next to LensLink (as the installer puts it), from `ANDROID_HOME`, from Android Studio's
+/// default SDK folder, otherwise whatever is on PATH.
 pub fn path() -> PathBuf {
-    if let Some(home) = std::env::var_os("ANDROID_HOME") {
-        let candidate = PathBuf::from(home).join("platform-tools").join("adb.exe");
-        if candidate.exists() {
-            return candidate;
-        }
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)) {
+        candidates.push(dir.join("adb.exe"));
+        candidates.push(dir.join("platform-tools").join("adb.exe"));
     }
-    PathBuf::from("adb")
+    if let Some(home) = std::env::var_os("ANDROID_HOME") {
+        candidates.push(PathBuf::from(home).join("platform-tools").join("adb.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("Android").join("Sdk").join("platform-tools").join("adb.exe"));
+    }
+    candidates.into_iter().find(|p| p.exists()).unwrap_or_else(|| PathBuf::from("adb"))
+}
+
+fn command() -> Command {
+    let mut cmd = Command::new(path());
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
 }
 
 pub fn run(serial: Option<&str>, args: &[&str]) -> Result<Output, String> {
-    let mut cmd = Command::new(path());
+    let mut cmd = command();
     if let Some(s) = serial {
         cmd.args(["-s", s]);
     }
@@ -43,7 +60,7 @@ pub struct DeviceWatch {
 
 impl DeviceWatch {
     pub fn start() -> Result<Self, String> {
-        let mut child = Command::new(path())
+        let mut child = command()
             .arg("track-devices")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -70,6 +87,7 @@ impl DeviceWatch {
 
     /// The newest device list; `None` until adb sent the first one. Err once adb quit (server killed,
     /// adb updated): start a new watch.
+    #[allow(clippy::result_unit_err)] // the only error is "adb quit"
     pub fn devices(&mut self) -> Result<Option<&[(String, String)]>, ()> {
         loop {
             match self.rx.try_recv() {

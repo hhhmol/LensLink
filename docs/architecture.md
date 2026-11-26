@@ -74,7 +74,8 @@ playing the stream into a user-installed virtual cable.
 5. **Controls** — a) video modes from the phone, chosen by apps ✓; b) lens/zoom, focus, exposure, ISO, WB as standard camera properties ✓
 6. **Filters** — shader filters, then segmentation, then interpolation.
 7. **Polish** ← now — a) auto-reconnect and autostart of the phone service ✓; b) stream only while an
-   app uses the camera, adb device events instead of polling ✓; c) tray app with a settings window;
+   app uses the camera, adb device events instead of polling ✓; c) the app: 1. tray, borderless
+   window, own window thread ✓; 2. liquid glass shader; 3. settings curtains; 4. widgets on the video;
    d) installer; e) battery/thermal guards on the phone.
 
 ## Virtual camera internals (step 4)
@@ -134,3 +135,28 @@ handshake → stream until the socket closes or no video arrives for 5 s → ret
 - Waiting for a phone uses one long-running `adb track-devices`, which pushes the device list on
   change, instead of starting `adb devices` every second; without a window the host wakes every
   100 ms (50 ms with a connected phone) to check for apps. Measured idle: 0.00 % CPU, 46 MB.
+
+## The app (step 7c)
+
+`lenslink-host` is a library with two binaries: the `lenslink-host` console tool and `LensLink.exe`
+(Windows subsystem, no console). The app runs the same streaming loop with a new output, the app
+window (`ui` module), and the virtual camera when it is installed.
+
+- **Two threads.** The streaming thread (adb, socket, decoder, virtual camera) is the one from the
+  console tool. The window has its own thread and message loop, so dragging or resizing never stalls
+  the stream and a slow phone never stalls the window. They share the D3D11 device: the streaming
+  thread converts each frame to BGRA on the GPU video processor (inside the multithreaded Direct2D
+  factory's lock) and posts a message; the window draws the texture with Direct2D. Frames are
+  converted only while the window is on screen. Hiding it (×, Esc, Alt+F4) leaves the tray icon; the
+  phone's camera then follows the virtual camera's use as in step 7b.
+- **Borderless.** `WM_NCCALCSIZE` gives the whole window to the client while the thick-frame style
+  keeps Windows 11's shadow, rounded corners, snapping and maximising. Dragging anywhere moves the
+  window (`SC_MOVE`); only the corners resize, keeping the video's aspect ratio, because the edges
+  are reserved for the settings curtains.
+- **Look, decided with prototypes:** controls float as liquid glass over the video: transparent, no
+  blur, a thick lens rim that refracts with RGB dispersion, shapes that merge like drops. Settings
+  hide in four elastic curtains, one per edge, whose edge is a string of springs (waves, overshoot,
+  bending towards the pointer); their text bends with them. Any item can be pulled onto the video as
+  a floating widget. The prototypes are kept outside the repository.
+- Settings live in `%APPDATA%\LensLink\settings.json` (unknown keys survive a save), the log in
+  `lenslink.log` next to it. A named mutex keeps one instance; a second start shows the first window.

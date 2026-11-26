@@ -1,14 +1,8 @@
-//! LensLink Windows host.
-
-mod adb;
-mod controls;
-mod modes;
-mod stream;
-mod video;
+//! `lenslink-host`: the LensLink command line tool, for debugging and scripting.
 
 use std::process::ExitCode;
 
-const APP_ID: &str = "io.github.lenslink";
+use lenslink_host::{adb, stream, APP_ID};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

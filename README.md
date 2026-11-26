@@ -31,9 +31,12 @@ Pre-alpha, steps 1–5 of the [roadmap](docs/architecture.md#roadmap) done, step
   by itself once the phone is back. The window and the virtual camera stay up meanwhile;
 - **camera on demand**: with `--vcam --no-play` the phone's camera runs only while an app shows
   LensLink, and stops 5 s after the last one closes it. Idle, the host uses no measurable CPU and the
-  phone keeps no wake lock.
+  phone keeps no wake lock;
+- the **LensLink app** (`LensLink.exe`): a borderless window with the video that lives in the tray,
+  connects to the phone and publishes the virtual camera by itself. Its liquid-glass controls are
+  being built.
 
-Not yet: filters, a tray app, an installer.
+Not yet: the settings in the app, filters, an installer.
 
 ## Layout
 
@@ -70,9 +73,27 @@ cargo run -p lenslink-host -- probe
 Xiaomi phones block `installDebug` unless *Install via USB* is enabled (needs a Mi account).
 Alternative: copy `android/app/build/outputs/apk/debug/app-debug.apk` to the phone and open it.
 
-## Streaming
+## The app
 
 On the phone: install LensLink and open it once to grant camera access. On the PC:
+
+```powershell
+cd pc
+cargo build --release
+.\target\release\LensLink.exe
+```
+
+The window shows the phone's camera. Drag it anywhere on the video, resize it at the corners,
+double-click to maximise. Closing it (×, Esc) keeps LensLink in the tray: click the tray icon to bring
+the window back, right-click it to quit. While the window is hidden the phone's camera runs only if an
+app uses the virtual camera (install it once, see below; without it the app works with the window
+only). `LensLink.exe --hidden` starts in the tray. Settings are in `%APPDATA%\LensLink\settings.json`,
+the log in `%APPDATA%\LensLink\lenslink.log`. adb is found next to `LensLink.exe`, through
+`ANDROID_HOME`, in Android Studio's SDK folder or on PATH.
+
+## Streaming from the command line
+
+`lenslink-host` is the same engine as a console tool, for debugging and scripting:
 
 ```powershell
 cd pc

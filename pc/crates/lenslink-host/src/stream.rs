@@ -45,6 +45,8 @@ pub enum Player {
     Window,
     /// ffplay, kept for comparison and for machines without a hardware decoder.
     Ffplay,
+    /// The LensLink app's window, on its own thread, hidden in the tray when closed.
+    App,
     None,
 }
 
@@ -181,12 +183,24 @@ pub fn run(o: &Options) -> Result<(), String> {
         None => None,
     };
     let mode = Mode { width: o.width, height: o.height, fps: o.fps };
-    let viewer = if o.player == Player::Window || o.virtual_camera {
+    let viewer = if matches!(o.player, Player::Window | Player::App) || o.virtual_camera {
         video::init()?;
-        let outputs = video::Outputs { window: o.player == Player::Window, virtual_camera: o.virtual_camera };
+        let outputs = video::Outputs {
+            window: o.player == Player::Window,
+            app: o.player == Player::App,
+            virtual_camera: o.virtual_camera,
+        };
         Some(Viewer::new(o.codec, mode, outputs)?)
     } else {
         None
+    };
+    // The app runs without the virtual camera when it is not installed.
+    let without_camera;
+    let o = if o.virtual_camera && !viewer.as_ref().is_some_and(Viewer::has_camera) {
+        without_camera = Options { virtual_camera: false, ..o.clone() };
+        &without_camera
+    } else {
+        o
     };
     let mut host = Host {
         o,

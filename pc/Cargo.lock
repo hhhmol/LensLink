@@ -16,6 +16,7 @@ dependencies = [
  "lenslink-vcam",
  "serde_json",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]

@@ -55,12 +55,16 @@ pub struct Viewer {
     mode: Mode,
     decoder: Decoder,
     preview: Option<Preview>,
+    app: Option<crate::ui::Link>,
     camera: Option<VirtualCamera>,
     controls: Vec<ControlDesc>,
 }
 
 pub struct Outputs {
+    /// The plain preview window of `lenslink-host stream`.
     pub window: bool,
+    /// The LensLink app window. The app goes on without the virtual camera if it cannot start.
+    pub app: bool,
     pub virtual_camera: bool,
 }
 
@@ -79,9 +83,17 @@ impl Viewer {
             .map_err(|e| format!("decoder: {e}"))?;
         let picture = (mode.width, mode.height);
         let camera = if outputs.virtual_camera {
-            let c = VirtualCamera::new(&device, picture, mode)?;
-            eprintln!("virtual camera \"{}\" is available to apps", lenslink_vcam::FRIENDLY_NAME);
-            Some(c)
+            match VirtualCamera::new(&device, picture, mode) {
+                Ok(c) => {
+                    eprintln!("virtual camera \"{}\" is available to apps", lenslink_vcam::FRIENDLY_NAME);
+                    Some(c)
+                }
+                Err(e) if outputs.app => {
+                    eprintln!("{e}; going on without the virtual camera");
+                    None
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             None
         };
@@ -90,12 +102,17 @@ impl Viewer {
         } else {
             None
         };
-        Ok(Viewer { device, codec, mode, decoder, preview, camera, controls: Vec::new() })
+        let app = if outputs.app { Some(crate::ui::Link::new(&device, picture)?) } else { None };
+        Ok(Viewer { device, codec, mode, decoder, preview, app, camera, controls: Vec::new() })
     }
 
-    /// Returns false once the user closed the window.
+    /// Returns false once the user closed the window (or quit the app).
     pub fn pump(&mut self) -> bool {
-        self.preview.as_mut().is_none_or(Preview::pump)
+        self.preview.as_mut().is_none_or(Preview::pump) && self.app.as_ref().is_none_or(|a| !a.quit_requested())
+    }
+
+    pub fn has_camera(&self) -> bool {
+        self.camera.is_some()
     }
 
     pub fn has_window(&self) -> bool {
@@ -104,7 +121,9 @@ impl Viewer {
 
     /// Whether anything shows the video now: the window, or an app streaming from the virtual camera.
     pub fn watched(&mut self) -> bool {
-        self.preview.is_some() || self.camera.as_mut().is_some_and(VirtualCamera::in_use)
+        self.preview.is_some()
+            || self.app.as_ref().is_some_and(crate::ui::Link::visible)
+            || self.camera.as_mut().is_some_and(VirtualCamera::in_use)
     }
 
     /// A mode an app selected on the virtual camera, once per change.
@@ -136,6 +155,9 @@ impl Viewer {
             p.set_picture(picture);
             p.set_title(&title(self.codec, mode));
         }
+        if let Some(a) = self.app.as_mut() {
+            a.set_picture(picture);
+        }
         Ok(())
     }
 
@@ -166,11 +188,17 @@ impl Viewer {
             if let Some(p) = self.preview.as_mut() {
                 p.show(frame).map_err(|e| format!("display: {e}"))?;
             }
+            if let Some(a) = self.app.as_mut() {
+                a.push(frame).map_err(|e| format!("window: {e}"))?;
+            }
         }
         Ok(())
     }
 
     pub fn status(&self, text: &str) {
+        if let Some(a) = &self.app {
+            a.status(text);
+        }
         if let Some(p) = &self.preview {
             let cam = match &self.camera {
                 Some(c) if c.connected() => "  camera in use",
