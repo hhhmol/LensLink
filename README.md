@@ -48,6 +48,21 @@ Not yet: the settings in the app, filters, an installer.
 | `docs/architecture.md` | Design decisions and roadmap |
 | `docs/protocol.md` | Wire protocol between phone and PC |
 
+## Quick start (test build)
+
+Download from [Releases](https://github.com/hhhmol/LensLink/releases):
+`LensLink-<version>-windows-x64.zip` and `LensLink-<version>.apk`.
+
+1. **Phone:** enable USB debugging (on Xiaomi also *Install via USB* if offered), install the APK,
+   open LensLink once and allow the camera, connect the phone and allow debugging.
+2. **PC (Windows 11):** unzip anywhere and run `LensLink.exe` (it is not signed yet: SmartScreen →
+   *More info* → *Run anyway*). It finds the phone by itself. To let Zoom, Teams, OBS or a browser use
+   the **LensLink** camera, run `install-camera.cmd` once (administrator); `uninstall-camera.cmd`
+   removes it.
+
+The archive's `README.txt` explains the same in Russian and English. Problems: attach
+`%APPDATA%\LensLink\lenslink.log`. Building a release: `tools\make-release.ps1 -Version x.y.z`.
+
 ## Requirements
 
 - Android 8.0+ phone with **USB debugging** enabled.

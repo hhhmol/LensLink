@@ -17,3 +17,6 @@ Thumbs.db
 
 # Local probe reports pulled from phones
 reports/
+
+# Release archives (tools\make-release.ps1)
+dist/

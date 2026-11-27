@@ -1,0 +1,4 @@
+# The C runtime is linked in, so LensLink.exe and the camera DLL run on a Windows without the
+# Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

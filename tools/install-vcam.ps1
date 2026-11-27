@@ -6,14 +6,26 @@ Why administrator: Windows loads the camera DLL inside the Frame Server service,
 registrations only from HKLM. The DLL is copied to Program Files so that only administrators can
 replace a file that a system service loads.
 
-    .\install-vcam.ps1               # install or update from pc\target\release
+    .\install-vcam.ps1               # install or update: the DLL next to this script (release
+                                     # archive), else pc\target\release
     .\install-vcam.ps1 -Uninstall    # remove
 #>
 param(
-    [string]$Dll = (Join-Path $PSScriptRoot '..\pc\target\release\lenslink_vcam.dll'),
-    [switch]$Uninstall
+    [string]$Dll,
+    [switch]$Uninstall,
+    # Wait for Enter before closing (run from install-camera.cmd in a window of its own).
+    [switch]$Pause
 )
 $ErrorActionPreference = 'Stop'
+trap {
+    Write-Host $_ -ForegroundColor Red
+    if ($Pause) { Read-Host 'Press Enter to close' | Out-Null }
+    exit 1
+}
+if (-not $Dll) {
+    $Dll = Join-Path $PSScriptRoot 'lenslink_vcam.dll'
+    if (-not (Test-Path $Dll)) { $Dll = Join-Path $PSScriptRoot '..\pc\target\release\lenslink_vcam.dll' }
+}
 $dir = Join-Path $env:ProgramFiles 'LensLink'
 $target = Join-Path $dir 'lenslink_vcam.dll'
 $logs = Join-Path $env:ProgramData 'LensLink\logs'
@@ -32,6 +44,7 @@ if ($Uninstall) {
     Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:ProgramData 'LensLink') -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host 'LensLink virtual camera removed.'
+    if ($Pause) { Read-Host 'Press Enter to close' | Out-Null }
     return
 }
 
@@ -46,3 +59,4 @@ icacls $config /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
 $p = Start-Process regsvr32 -ArgumentList '/s', "`"$target`"" -Wait -PassThru
 if ($p.ExitCode -ne 0) { throw "regsvr32 failed with code $($p.ExitCode)" }
 Write-Host "LensLink virtual camera installed: $target"
+if ($Pause) { Read-Host 'Press Enter to close' | Out-Null }
